@@ -1,0 +1,6 @@
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"
+# Retain the upstream translation catalog without retaining its package identity.
+domain = "cosmic_term"

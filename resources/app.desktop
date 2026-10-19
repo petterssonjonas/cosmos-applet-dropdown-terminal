@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Cosmos Dropdown Terminal
+Comment=Show or hide a persistent dropdown terminal for the COSMIC desktop
+Type=Application
+Icon=utilities-terminal
+Exec=cosmos-applet-dropdown-terminal
+Terminal=false
+StartupNotify=false
+Categories=COSMIC;System;TerminalEmulator;
+Keywords=Terminal;Dropdown;Console;
+NoDisplay=true
+X-CosmicApplet=true
+X-HostWaylandDisplay=true
+X-CosmicHoverPopup=Auto

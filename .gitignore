@@ -1,0 +1,5 @@
+/target/
+/shortcut/target/
+/terminal/target/
+**/__pycache__/
+*.pyc

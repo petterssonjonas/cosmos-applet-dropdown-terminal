@@ -1,0 +1,11 @@
+[package]
+name = "cosmos-applet-dropdown-terminal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-only"
+description = "Cosmos persistent native dropdown terminal applet for COSMIC"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", default-features = false, features = ["applet", "applet-token", "dbus-config", "multi-window", "tokio", "wayland", "winit", "wgpu", "surface-message"] }
+tokio = { version = "1", features = ["process", "time"] }
