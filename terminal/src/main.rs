@@ -723,9 +723,8 @@ impl App {
                 };
             }
             Wayland::Layer(LayerEvent::Done, _, id) => return self.surface_closed(id),
-            Wayland::Layer(LayerEvent::Focused, _, id)
-                if self.dropdown.surface == Some(id) && self.dropdown.ready() =>
-            {
+            Wayland::Layer(LayerEvent::Focused, _, id) if self.dropdown.surface == Some(id) => {
+                // Keyboard enter can arrive before the first surface-opened event.
                 return self
                     .set_dropdown_raised(true)
                     .chain(self.update(Message::WindowFocused));
