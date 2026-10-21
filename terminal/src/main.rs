@@ -233,17 +233,17 @@ fn print_help() {
         r#"Cosmos Dropdown Terminal
 Native Wayland dropdown terminal; configurable screen percentages, no animation.
 
-Usage: cosmos-applet-dropdown-terminal-backend [toggle|toggle-visibility|show|hide|status|reload|quit|start]
+Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|reload|quit|start|panel-guard]
        cosmos-applet-dropdown-terminal-backend --daemon [-w DIR] [-e PROGRAM [ARGS...]]
 
-  toggle (default)   Toggle, or restore a covered dropdown; start a backend if needed
-  toggle-visibility  Toggle mapped visibility regardless of focus (panel icon)
+  toggle (default)   Show a hidden dropdown or hide an open dropdown, even if covered
   show               Show; start a backend if needed
   hide               Hide without terminating shells
   status             Print visible, hidden, or stopped
   reload             Apply saved settings without showing or restarting the backend
   quit               Terminate backend and its shells
   start              Ensure a backend exists; leave visibility unchanged
+  panel-guard        Protect panel interaction until stdin or backend disconnects
   --daemon           Run the persistent backend in foreground, initially hidden
   -w, --working-directory DIR
   -e, --command PROGRAM [ARGS...]
@@ -251,8 +251,8 @@ Usage: cosmos-applet-dropdown-terminal-backend [toggle|toggle-visibility|show|hi
   -V, --version      Show version
 
 Socket: $XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/control.sock
-Commands: toggle/toggle-visibility/show/hide/status/reload/quit followed by newline.
-Replies: visible/hidden/reloaded/bye, or error MESSAGE followed by newline.
+Commands: toggle/show/hide/status/reload/quit/panel-guard followed by newline.
+Replies: visible/hidden/reloaded/bye/guarded, or error MESSAGE followed by newline.
 First advertised usable output is selected; output changes resize the surface."#
     );
 }
@@ -384,6 +384,7 @@ impl MenuAction for Action {
 #[derive(Clone, Debug)]
 pub enum Message {
     Control(control::Request),
+    PanelGuardReleased,
     Wayland(iced::core::event::wayland::Event),
     SurfaceOpened(window::Id, iced::Size),
     SurfaceClosed(window::Id),
@@ -595,6 +596,7 @@ impl App {
             KeyboardInteractivity, set_keyboard_interactivity,
         };
         self.dropdown.visible = visible;
+        self.dropdown.clear_focus_loss();
         let stacking = if visible {
             self.set_dropdown_raised(true)
         } else {
@@ -632,6 +634,17 @@ impl App {
             )
         } else {
             Task::none()
+        }
+    }
+
+    fn apply_dropdown_focus_loss(&mut self) -> Task<Message> {
+        if !self.dropdown.take_focus_loss() || !self.dropdown.visible {
+            return Task::none();
+        }
+        if self.config.dropdown_close_on_focus_loss {
+            self.set_dropdown_visible(false)
+        } else {
+            self.set_dropdown_raised(false)
         }
     }
 
@@ -737,16 +750,19 @@ impl App {
             Wayland::Layer(LayerEvent::Done, _, id) => return self.surface_closed(id),
             Wayland::Layer(LayerEvent::Focused, _, id) if self.dropdown.surface == Some(id) => {
                 // Keyboard enter can arrive before the first surface-opened event.
+                self.dropdown.clear_focus_loss();
                 return self
                     .set_dropdown_raised(true)
                     .chain(self.update(Message::WindowFocused));
             }
             Wayland::Layer(LayerEvent::Unfocused, _, id)
-                if self.dropdown.surface == Some(id) && self.dropdown.ready() =>
+                if self.dropdown.surface == Some(id)
+                    && (self.dropdown.ready() || self.dropdown.creating()) =>
             {
+                self.dropdown.focus_lost();
                 return self
-                    .set_dropdown_raised(false)
-                    .chain(self.update(Message::WindowUnfocused));
+                    .update(Message::WindowUnfocused)
+                    .chain(self.apply_dropdown_focus_loss());
             }
             _ => (),
         }
@@ -2225,6 +2241,10 @@ impl Application for App {
             };
         }
         match message {
+            Message::PanelGuardReleased => {
+                self.dropdown.panel_guard_released();
+                return self.apply_dropdown_focus_loss();
+            }
             Message::QuitAcknowledged => return iced::exit(),
             Message::ReloadConfig => match self.reload_config() {
                 Ok(task) => return task,
@@ -2237,10 +2257,15 @@ impl Application for App {
                 use control::Command;
                 let task = match request.command {
                     Command::Toggle => {
-                        let visible = self.dropdown.prepare_toggle();
+                        let visible = !self.dropdown.visible;
                         self.set_dropdown_visible(visible)
                     }
-                    Command::ToggleVisibility => self.set_dropdown_visible(!self.dropdown.visible),
+                    Command::PanelGuard => {
+                        if request.reply.send("guarded").is_ok() {
+                            self.dropdown.panel_guard_acquired();
+                        }
+                        return Task::none();
+                    }
                     Command::Show => self.set_dropdown_visible(true),
                     Command::Hide => self.set_dropdown_visible(false),
                     Command::Status => Task::none(),

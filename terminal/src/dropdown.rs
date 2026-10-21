@@ -42,6 +42,8 @@ pub struct Dropdown {
     available_height: Option<u32>,
     configured_size: Option<Size>,
     measurement_margin: Option<u32>,
+    panel_guards: usize,
+    focus_loss_pending: bool,
 }
 
 impl Default for Dropdown {
@@ -60,6 +62,8 @@ impl Default for Dropdown {
             available_height: None,
             configured_size: None,
             measurement_margin: None,
+            panel_guards: 0,
+            focus_loss_pending: false,
         }
     }
 }
@@ -92,15 +96,25 @@ impl Dropdown {
         self.layer() != previous
     }
 
-    /// Return the toggle's requested visibility and prepare any surface replacement.
-    pub fn prepare_toggle(&mut self) -> bool {
-        let covered = self.visible && self.layer() == Layer::Bottom;
-        if covered {
-            // Remapping restores compositor focus without exclusive keyboard capture.
-            // Only the surface is replaced; terminal models and PTYs stay alive.
-            self.surface_invalidated |= self.surface.is_some();
-        }
-        !self.visible || covered
+    pub fn clear_focus_loss(&mut self) {
+        self.focus_loss_pending = false;
+    }
+
+    pub fn focus_lost(&mut self) {
+        self.focus_loss_pending = true;
+    }
+
+    pub fn panel_guard_acquired(&mut self) {
+        self.panel_guards += 1;
+    }
+
+    pub fn panel_guard_released(&mut self) {
+        debug_assert!(self.panel_guards > 0);
+        self.panel_guards = self.panel_guards.saturating_sub(1);
+    }
+
+    pub fn take_focus_loss(&mut self) -> bool {
+        self.panel_guards == 0 && std::mem::take(&mut self.focus_loss_pending)
     }
 
     pub fn begin_close(&mut self) -> Option<window::Id> {
@@ -577,37 +591,34 @@ mod tests {
     }
 
     #[test]
-    fn toggle_restores_covered_dropdown_then_hides_it_on_next_activation() {
+    fn panel_controls_defer_focus_loss_until_the_last_guard_disconnects() {
         let mut dropdown = Dropdown::default();
-        dropdown.configure(40, 100, false);
-        dropdown.visible = dropdown.prepare_toggle();
-        let old = window::Id::unique();
-        dropdown.begin_create(old);
-        assert!(dropdown.opened(old));
-        assert!(dropdown.set_raised(false));
-        dropdown.visible = dropdown.prepare_toggle();
-        dropdown.set_raised(true);
-        assert!(dropdown.visible);
-        assert_eq!(dropdown.begin_close(), Some(old));
-        assert!(dropdown.settings().is_none());
-        assert!(dropdown.surface_closed(old));
-        assert!(dropdown.visible);
-        let new = window::Id::unique();
-        dropdown.begin_create(new);
-        assert!(dropdown.opened(new));
-        assert_eq!(dropdown.layer(), Layer::Top);
-        dropdown.visible = dropdown.prepare_toggle();
-        assert!(!dropdown.visible);
-        assert_eq!(dropdown.begin_close(), Some(new));
+        dropdown.panel_guard_acquired();
+        dropdown.panel_guard_acquired();
+        dropdown.focus_lost();
+        assert!(!dropdown.take_focus_loss());
+        dropdown.panel_guard_released();
+        assert!(!dropdown.take_focus_loss());
+        dropdown.panel_guard_released();
+        assert!(dropdown.take_focus_loss());
+        assert!(!dropdown.take_focus_loss());
     }
 
     #[test]
-    fn toggle_hides_pinned_dropdown_even_when_another_application_has_focus() {
-        let mut dropdown = Dropdown {
-            visible: true,
-            ..Default::default()
-        };
-        dropdown.set_raised(false);
-        assert!(!dropdown.prepare_toggle());
+    fn regained_focus_or_explicit_visibility_change_cancels_deferred_focus_loss() {
+        let mut dropdown = Dropdown::default();
+        dropdown.panel_guard_acquired();
+        dropdown.focus_lost();
+        dropdown.clear_focus_loss();
+        dropdown.panel_guard_released();
+        assert!(!dropdown.take_focus_loss());
+    }
+
+    #[test]
+    fn unguarded_focus_loss_is_immediate_and_not_repeated() {
+        let mut dropdown = Dropdown::default();
+        dropdown.focus_lost();
+        assert!(dropdown.take_focus_loss());
+        assert!(!dropdown.take_focus_loss());
     }
 }

@@ -13,6 +13,8 @@ pub struct Preferences {
     pub dropdown_height_percent: u8,
     pub dropdown_width_percent: u8,
     pub dropdown_always_on_top: bool,
+    #[serde(default)]
+    pub dropdown_close_on_focus_loss: bool,
 }
 
 impl Default for Preferences {
@@ -21,6 +23,7 @@ impl Default for Preferences {
             dropdown_height_percent: 40,
             dropdown_width_percent: 100,
             dropdown_always_on_top: true,
+            dropdown_close_on_focus_loss: false,
         }
     }
 }
@@ -81,6 +84,7 @@ fn save_to(
     stage!(dropdown_height_percent);
     stage!(dropdown_width_percent);
     stage!(dropdown_always_on_top);
+    stage!(dropdown_close_on_focus_loss);
     // COSMIC commits keys individually, so callers must report possible partial writes.
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -106,9 +110,14 @@ mod tests {
     #[test]
     fn save_preserves_external_changes_to_untouched_fields() {
         let (path, config) = config();
+        config.set("dropdown_height_percent", 40_u8).unwrap();
+        config.set("dropdown_width_percent", 100_u8).unwrap();
+        config.set("dropdown_always_on_top", true).unwrap();
         let original = load_from(&config).unwrap();
+        assert!(!original.dropdown_close_on_focus_loss);
         let mut draft = original.clone();
         draft.dropdown_height_percent = 75;
+        draft.dropdown_close_on_focus_loss = true;
         config.set("dropdown_width_percent", 65_u8).unwrap();
         save_to(&config, &original, &draft).unwrap();
         draft.dropdown_width_percent = 65;
@@ -123,12 +132,14 @@ mod tests {
         let mut draft = original.clone();
         draft.dropdown_height_percent = 75;
         draft.dropdown_width_percent = 50;
+        draft.dropdown_close_on_focus_loss = true;
         config.set("dropdown_width_percent", 65_u8).unwrap();
         assert!(save_to(&config, &original, &draft).is_err());
         assert_eq!(
             load_from(&config).unwrap().dropdown_height_percent,
             original.dropdown_height_percent
         );
+        assert!(!load_from(&config).unwrap().dropdown_close_on_focus_loss);
         std::fs::remove_dir_all(path).unwrap();
     }
 

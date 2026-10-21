@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Private, single-owner control endpoint. The lock inode is never unlinked: doing so
 //! would let two launchers lock different inodes and both become the owner.
-use cosmic::iced::{self, Subscription, stream};
+use cosmic::iced::{self, Subscription, futures::SinkExt, stream};
 use std::os::unix::process::CommandExt;
 use std::{
     env,
     fs::{self, DirBuilder, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     os::unix::{
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -83,7 +83,7 @@ fn wait_for_display_disconnect(socket: UnixStream) -> io::Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Toggle,
-    ToggleVisibility,
+    PanelGuard,
     Show,
     Hide,
     Status,
@@ -94,7 +94,7 @@ impl Command {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "toggle" => Self::Toggle,
-            "toggle-visibility" => Self::ToggleVisibility,
+            "panel-guard" => Self::PanelGuard,
             "show" => Self::Show,
             "hide" => Self::Hide,
             "status" => Self::Status,
@@ -106,7 +106,7 @@ impl Command {
     pub fn name(self) -> &'static str {
         match self {
             Self::Toggle => "toggle",
-            Self::ToggleVisibility => "toggle-visibility",
+            Self::PanelGuard => "panel-guard",
             Self::Show => "show",
             Self::Hide => "hide",
             Self::Status => "status",
@@ -259,6 +259,24 @@ impl Server {
                                 continue;
                             };
                             let (reply, response) = mpsc::channel();
+                            if command == Command::PanelGuard {
+                                let guard_output = output.clone();
+                                if let Err(err) =
+                                    thread::Builder::new().name("panel-guard".into()).spawn(
+                                        move || serve_panel_guard(socket, response, guard_output),
+                                    )
+                                {
+                                    log::error!("panel guard worker: {err}");
+                                    continue;
+                                }
+                                if output
+                                    .try_send(crate::Message::Control(Request { command, reply }))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                             if output
                                 .try_send(crate::Message::Control(Request { command, reply }))
                                 .is_err()
@@ -281,6 +299,63 @@ impl Server {
                 },
             )
         })
+    }
+}
+
+fn serve_panel_guard(
+    mut socket: UnixStream,
+    response: mpsc::Receiver<&'static str>,
+    mut output: iced::futures::channel::mpsc::Sender<crate::Message>,
+) {
+    match response.recv_timeout(Duration::from_secs(5)) {
+        Ok(answer) => {
+            let acknowledged = writeln!(socket, "{answer}").is_ok();
+            if answer != "guarded" {
+                return;
+            }
+            if acknowledged && let Err(err) = wait_for_panel_guard_end(&socket, None) {
+                log::warn!("panel guard connection: {err}");
+            }
+        }
+        Err(err) => {
+            let _ = socket.write_all(b"error backend did not respond\n");
+            drop(socket);
+            // A queued acquisition can finish after timeout. Keep its reply receiver
+            // alive so a late successful acquisition always has a matching release.
+            if err != mpsc::RecvTimeoutError::Timeout || response.recv() != Ok("guarded") {
+                return;
+            }
+        }
+    }
+    let _ = iced::futures::executor::block_on(output.send(crate::Message::PanelGuardReleased));
+}
+
+fn wait_for_panel_guard_end(socket: &UnixStream, input: Option<BorrowedFd<'_>>) -> io::Result<()> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: input.map_or(-1, |fd| fd.as_raw_fd()),
+            // Only pipe closure matters; unread stdin must not wake this monitor.
+            events: 0,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: both descriptors remain borrowed for this call; poll ignores -1.
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        // The lease protocol sends no further socket data. Any socket readiness
+        // ends the lease; stdin contributes only hangup/error events.
+        if result > 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
 }
 
@@ -348,7 +423,7 @@ fn request(directory: &Path, command: Command) -> io::Result<String> {
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
     writeln!(socket, "{}", command.name())?;
     let mut response = String::new();
-    BufReader::new(socket.take(256)).read_line(&mut response)?;
+    BufReader::new((&socket).take(256)).read_line(&mut response)?;
     if !response.ends_with('\n') {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -360,6 +435,21 @@ fn request(directory: &Path, command: Command) -> io::Result<String> {
     }
     if command == Command::Quit {
         wait_for_shutdown(directory, original_socket.as_ref(), Duration::from_secs(5))?;
+    }
+    if command == Command::PanelGuard {
+        if response != "guarded\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backend did not acknowledge panel guard",
+            ));
+        }
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(response.as_bytes())?;
+        stdout.flush()?;
+        drop(stdout);
+        let stdin = io::stdin();
+        wait_for_panel_guard_end(&socket, Some(stdin.as_fd()))?;
+        response.clear();
     }
     Ok(response)
 }
@@ -395,6 +485,8 @@ fn client_inner(command: Command, ensure_running: bool) -> io::Result<()> {
         println!("stopped");
         return Ok(());
     }
+    // Panel interaction must recover a stopped backend before enabling its icon.
+    // Acquiring the guard starts the daemon hidden; only the completed click shows it.
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -491,7 +583,7 @@ mod tests {
     fn accepts_only_documented_commands() {
         for name in [
             "toggle",
-            "toggle-visibility",
+            "panel-guard",
             "show",
             "hide",
             "status",
@@ -501,6 +593,176 @@ mod tests {
             assert_eq!(Command::parse(name).unwrap().name(), name);
         }
         assert_eq!(Command::parse("toggle show"), None);
+        assert_eq!(Command::parse("toggle-visibility"), None);
+    }
+
+    #[test]
+    fn panel_guard_releases_only_after_client_disconnect() {
+        let (mut client, socket) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (reply, response) = mpsc::channel();
+        let (output, mut events) = iced::futures::channel::mpsc::channel(1);
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            serve_panel_guard(socket, response, output);
+            completed.send(()).unwrap();
+        });
+        reply.send("guarded").unwrap();
+        let mut answer = String::new();
+        BufReader::new(&mut client).read_line(&mut answer).unwrap();
+        assert_eq!(answer, "guarded\n");
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(client);
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(crate::Message::PanelGuardReleased)
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn rejected_panel_guard_has_no_release() {
+        let (_client, socket) = UnixStream::pair().unwrap();
+        let (reply, response) = mpsc::channel();
+        let (output, mut events) = iced::futures::channel::mpsc::channel(1);
+        reply.send("error refused").unwrap();
+        serve_panel_guard(socket, response, output);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn panel_guard_release_waits_for_control_queue_capacity() {
+        let (client, socket) = UnixStream::pair().unwrap();
+        let (reply, response) = mpsc::channel();
+        let (mut output, mut events) = iced::futures::channel::mpsc::channel(1);
+        output.try_send(crate::Message::QuitAcknowledged).unwrap();
+        output.try_send(crate::Message::QuitAcknowledged).unwrap();
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            serve_panel_guard(socket, response, output);
+            completed.send(()).unwrap();
+        });
+        reply.send("guarded").unwrap();
+        drop(client);
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                events.try_recv(),
+                Ok(crate::Message::QuitAcknowledged)
+            ));
+        }
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(crate::Message::PanelGuardReleased)
+        ));
+    }
+
+    #[test]
+    fn panel_guard_releases_when_acknowledgement_cannot_be_written() {
+        let (client, socket) = UnixStream::pair().unwrap();
+        let (reply, response) = mpsc::channel();
+        let (output, mut events) = iced::futures::channel::mpsc::channel(1);
+        reply.send("guarded").unwrap();
+        drop(client);
+        serve_panel_guard(socket, response, output);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(crate::Message::PanelGuardReleased)
+        ));
+    }
+
+    #[test]
+    fn timed_out_panel_guard_releases_a_late_acquisition() {
+        let (mut client, socket) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        let (reply, response) = mpsc::channel();
+        let (output, mut events) = iced::futures::channel::mpsc::channel(1);
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            serve_panel_guard(socket, response, output);
+            completed.send(()).unwrap();
+        });
+        let mut answer = String::new();
+        BufReader::new(&mut client).read_line(&mut answer).unwrap();
+        assert_eq!(answer, "error backend did not respond\n");
+        reply.send("guarded").unwrap();
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(crate::Message::PanelGuardReleased)
+        ));
+    }
+
+    fn input_pipe() -> (File, File) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors has space for both fresh pipe descriptors.
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 returned two distinct, owned descriptors.
+        unsafe {
+            (
+                File::from_raw_fd(descriptors[0]),
+                File::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn panel_guard_wait_ignores_input_and_finishes_when_pipe_closes() {
+        let (socket, _backend) = UnixStream::pair().unwrap();
+        let (input, mut writer) = input_pipe();
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            completed
+                .send(wait_for_panel_guard_end(&socket, Some(input.as_fd())))
+                .unwrap();
+        });
+        writer.write_all(b"keep open").unwrap();
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(writer);
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn panel_guard_wait_finishes_on_backend_eof_with_input_still_open() {
+        let (socket, backend) = UnixStream::pair().unwrap();
+        let (input, _writer) = input_pipe();
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            completed
+                .send(wait_for_panel_guard_end(&socket, Some(input.as_fd())))
+                .unwrap();
+        });
+        backend.shutdown(std::net::Shutdown::Write).unwrap();
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
     #[test]
     fn quit_waits_for_owner_release_after_bye() {

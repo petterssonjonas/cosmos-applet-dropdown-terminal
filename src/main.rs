@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+mod panel;
 mod settings;
 
 use cosmic::app::{Core, Task};
@@ -40,11 +41,21 @@ struct Applet {
     shortcut_modifiers: Modifiers,
     shortcut_key: String,
     saving: bool,
+    panel_guard: panel::Guard,
+    panel_error: Option<String>,
+    panel_pressed: Option<u64>,
+    icon_hovered: bool,
+    backend_starting: bool,
 }
 
 #[derive(Clone, Debug)]
 enum Message {
     Toggle,
+    IconPressed(u64),
+    IconHovered(bool),
+    IconPointer(window::Id, bool),
+    Panel(panel::Event),
+    BackendStarted(Result<(), String>),
     Completed(Result<(), String>),
     Surface(cosmic::surface::Action<Message>),
     Menu,
@@ -55,6 +66,7 @@ enum Message {
     Height(u8),
     Width(u8),
     AlwaysOnTop(bool),
+    CloseOnFocusLoss(bool),
     ShortcutModifier(Modifiers, bool),
     ShortcutKey(String),
     ShortcutLoaded(window::Id, Result<String, String>),
@@ -265,6 +277,203 @@ impl Applet {
         self.shortcut = label;
     }
 
+    fn can_toggle(&self) -> bool {
+        !self.busy && !self.saving && self.panel_guard.acknowledged().is_some()
+    }
+
+    fn sync_panel_guard(&mut self) {
+        self.panel_guard
+            .set_needed(!self.backend_starting && (self.icon_hovered || self.popup.is_some()));
+        if !self.can_toggle() || !self.icon_hovered {
+            self.panel_pressed = None;
+        }
+    }
+
+    fn set_icon_hovered(&mut self, hovered: bool) {
+        self.icon_hovered = hovered;
+        if !hovered {
+            self.panel_pressed = None;
+        }
+    }
+
+    fn control_completed(&mut self, result: Result<(), String>) {
+        self.busy = false;
+        self.error = result.err();
+        if let Some(error) = &self.error {
+            eprintln!("{error}");
+        }
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Toggle
+                if self.can_toggle() && self.panel_pressed == self.panel_guard.acknowledged() =>
+            {
+                self.panel_pressed = None;
+                self.busy = true;
+                return self
+                    .close_popup()
+                    .chain(iced::Task::perform(control("toggle"), |result| {
+                        action::app(Message::Completed(result))
+                    }));
+            }
+            Message::IconPressed(generation) => {
+                self.panel_pressed = self
+                    .panel_guard
+                    .acknowledged()
+                    .filter(|&active| self.can_toggle() && active == generation);
+            }
+            Message::IconHovered(hovered) => self.set_icon_hovered(hovered),
+            Message::IconPointer(id, hovered) if self.core.main_window_id() == Some(id) => {
+                self.set_icon_hovered(hovered);
+            }
+            Message::Panel(event) => {
+                if self.panel_guard.receive(&event) {
+                    match event {
+                        panel::Event::Ready(_) => self.panel_error = None,
+                        panel::Event::Ended(_, Some(error)) => {
+                            eprintln!("{error}");
+                            self.panel_error = Some(error);
+                        }
+                        panel::Event::Ended(_, None) => {}
+                    }
+                }
+            }
+            Message::BackendStarted(result) => {
+                self.backend_starting = false;
+                self.panel_guard.set_needed(false);
+                self.control_completed(result);
+            }
+            Message::Completed(result) => self.control_completed(result),
+            Message::Surface(action) => {
+                return cosmic::task::message(cosmic::Action::Surface(action));
+            }
+            // Recovery must remain reachable while an older backend is still running.
+            Message::Menu => {
+                return if self.popup.is_some() {
+                    self.close_popup()
+                } else {
+                    self.open_popup(Page::Menu)
+                };
+            }
+            Message::Settings if !self.busy && !self.saving => {
+                return self.open_popup(Page::Settings);
+            }
+            Message::ConfirmRestart if !self.busy && !self.saving => {
+                return self.open_popup(Page::ConfirmRestart);
+            }
+            Message::Restart
+                if !self.busy
+                    && !self.saving
+                    && self.popup.is_some()
+                    && self.page == Page::ConfirmRestart =>
+            {
+                self.busy = true;
+                self.backend_starting = true;
+                self.error = None;
+                return self
+                    .close_popup()
+                    .chain(iced::Task::perform(restart(), |result| {
+                        action::app(Message::BackendStarted(result))
+                    }));
+            }
+            Message::ClosePopup(id) if self.popup == Some(id) => return self.close_popup(),
+            Message::Height(value) if !self.saving => {
+                self.preferences.dropdown_height_percent = value.clamp(1, 100);
+            }
+            Message::Width(value) if !self.saving => {
+                self.preferences.dropdown_width_percent = value.clamp(1, 100);
+            }
+            Message::AlwaysOnTop(value) if !self.saving => {
+                self.preferences.dropdown_always_on_top = value;
+            }
+            Message::CloseOnFocusLoss(value) if !self.saving => {
+                self.preferences.dropdown_close_on_focus_loss = value;
+            }
+            Message::ShortcutModifier(modifier, enabled) if !self.saving => {
+                self.shortcut_modifiers.set(modifier, enabled);
+                self.shortcut_edited = true;
+            }
+            Message::ShortcutKey(key) if !self.saving => {
+                self.shortcut_key = key;
+                self.shortcut_edited = true;
+            }
+            Message::ShortcutLoaded(id, result) if self.popup == Some(id) => {
+                self.shortcut_busy = false;
+                match result {
+                    Ok(label) => self.receive_shortcut(label),
+                    Err(error) => self.shortcut_error = Some(error),
+                }
+            }
+            Message::Save if !self.saving && !self.shortcut_busy => {
+                let (Some(id), Some(original)) = (self.popup, &self.original_preferences) else {
+                    return Task::none();
+                };
+                if self.shortcut_edited && self.shortcut_error.is_some() {
+                    self.settings_error = Some(
+                        "Cannot safely replace an unread shortcut. Cancel and reopen settings to retry."
+                            .into(),
+                    );
+                    return Task::none();
+                }
+                let binding = self.shortcut_edited.then(|| {
+                    let mut modifiers = String::new();
+                    for (modifier, name) in MODIFIERS {
+                        if self.shortcut_modifiers.contains(modifier) {
+                            if !modifiers.is_empty() {
+                                modifiers.push(',');
+                            }
+                            modifiers.push_str(name);
+                        }
+                    }
+                    (modifiers, self.shortcut_key.clone(), self.shortcut.clone())
+                });
+                self.saving = true;
+                self.settings_error = None;
+                return iced::Task::perform(
+                    save_settings(original.clone(), self.preferences.clone(), binding),
+                    move |(result, label)| action::app(Message::Saved(id, result, label)),
+                );
+            }
+            Message::Saved(id, result, label) => {
+                self.saving = false;
+                if self.popup == Some(id) {
+                    if let Some(label) = label {
+                        self.shortcut = label;
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.original_preferences = Some(self.preferences.clone());
+                            self.error = None;
+                            return self.close_popup();
+                        }
+                        Err(error) => self.settings_error = Some(error),
+                    }
+                } else if let Err(error) = result {
+                    // Dismissing an in-flight Save must not silently hide its failure.
+                    self.error = Some(error);
+                }
+            }
+            Message::Cancel if !self.saving => return self.close_popup(),
+            Message::Toggle => self.panel_pressed = None,
+            Message::IconPointer(..)
+            | Message::Settings
+            | Message::ConfirmRestart
+            | Message::Restart
+            | Message::ClosePopup(_)
+            | Message::Height(_)
+            | Message::Width(_)
+            | Message::AlwaysOnTop(_)
+            | Message::CloseOnFocusLoss(_)
+            | Message::Save
+            | Message::Cancel
+            | Message::ShortcutLoaded(..)
+            | Message::ShortcutModifier(..)
+            | Message::ShortcutKey(_) => {}
+        }
+        Task::none()
+    }
+
     fn settings_view(&self) -> Element<'_, Message> {
         let height = self.preferences.dropdown_height_percent;
         let width = self.preferences.dropdown_width_percent;
@@ -321,7 +530,21 @@ impl Applet {
             .spacing(12)
             .into(),
             widget::text(
-                "Off lets other windows cover the dropdown when it loses focus. Opening it raises it.",
+                "Controls stacking only. Off lets clicked windows cover the dropdown; on keeps it above without taking input focus.",
+            )
+            .size(12)
+            .into(),
+            widget::row([
+                widget::text("Close on focus loss").width(Length::Fill).into(),
+                widget::toggler(self.preferences.dropdown_close_on_focus_loss)
+                    .on_toggle(Message::CloseOnFocusLoss)
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(12)
+            .into(),
+            widget::text(
+                "Hide when focus leaves the terminal. The applet icon and menu are exempt. Shells keep running.",
             )
             .size(12)
             .into(),
@@ -405,165 +628,50 @@ impl cosmic::Application for Applet {
                 shortcut_modifiers: Modifiers::LOGO,
                 shortcut_key: "§".into(),
                 saving: false,
+                panel_guard: panel::Guard::default(),
+                panel_error: None,
+                panel_pressed: None,
+                icon_hovered: false,
+                backend_starting: true,
             },
             iced::Task::perform(control("start"), |result| {
-                action::app(Message::Completed(result))
+                action::app(Message::BackendStarted(result))
             }),
         )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::Toggle if !self.busy && !self.saving => {
-                self.busy = true;
-                return self.close_popup().chain(iced::Task::perform(
-                    control("toggle-visibility"),
-                    |result| action::app(Message::Completed(result)),
-                ));
-            }
-            Message::Completed(result) => {
-                self.busy = false;
-                self.error = result.err();
-                if let Some(error) = &self.error {
-                    eprintln!("{error}");
-                }
-            }
-            Message::Surface(action) => {
-                return cosmic::task::message(cosmic::Action::Surface(action));
-            }
-            Message::Menu => {
-                return if self.popup.is_some() {
-                    self.close_popup()
-                } else {
-                    self.open_popup(Page::Menu)
-                };
-            }
-            Message::Settings if !self.busy && !self.saving => {
-                return self.open_popup(Page::Settings);
-            }
-            Message::ConfirmRestart if !self.busy && !self.saving => {
-                return self.open_popup(Page::ConfirmRestart);
-            }
-            Message::Restart
-                if !self.busy
-                    && !self.saving
-                    && self.popup.is_some()
-                    && self.page == Page::ConfirmRestart =>
-            {
-                self.busy = true;
-                self.error = None;
-                return self
-                    .close_popup()
-                    .chain(iced::Task::perform(restart(), |result| {
-                        action::app(Message::Completed(result))
-                    }));
-            }
-            Message::ClosePopup(id) if self.popup == Some(id) => return self.close_popup(),
-            Message::Height(value) if !self.saving => {
-                self.preferences.dropdown_height_percent = value.clamp(1, 100);
-            }
-            Message::Width(value) if !self.saving => {
-                self.preferences.dropdown_width_percent = value.clamp(1, 100);
-            }
-            Message::AlwaysOnTop(value) if !self.saving => {
-                self.preferences.dropdown_always_on_top = value;
-            }
-            Message::ShortcutModifier(modifier, enabled) if !self.saving => {
-                self.shortcut_modifiers.set(modifier, enabled);
-                self.shortcut_edited = true;
-            }
-            Message::ShortcutKey(key) if !self.saving => {
-                self.shortcut_key = key;
-                self.shortcut_edited = true;
-            }
-            Message::ShortcutLoaded(id, result) if self.popup == Some(id) => {
-                self.shortcut_busy = false;
-                match result {
-                    Ok(label) => self.receive_shortcut(label),
-                    Err(error) => self.shortcut_error = Some(error),
-                }
-            }
-            Message::Save if !self.saving && !self.shortcut_busy => {
-                let (Some(id), Some(original)) = (self.popup, &self.original_preferences) else {
-                    return Task::none();
-                };
-                if self.shortcut_edited && self.shortcut_error.is_some() {
-                    self.settings_error = Some(
-                        "Cannot safely replace an unread shortcut. Cancel and reopen settings to retry."
-                            .into(),
-                    );
-                    return Task::none();
-                }
-                let binding = self.shortcut_edited.then(|| {
-                    let mut modifiers = String::new();
-                    for (modifier, name) in MODIFIERS {
-                        if self.shortcut_modifiers.contains(modifier) {
-                            if !modifiers.is_empty() {
-                                modifiers.push(',');
-                            }
-                            modifiers.push_str(name);
-                        }
-                    }
-                    (modifiers, self.shortcut_key.clone(), self.shortcut.clone())
-                });
-                self.saving = true;
-                self.settings_error = None;
-                return iced::Task::perform(
-                    save_settings(original.clone(), self.preferences.clone(), binding),
-                    move |(result, label)| action::app(Message::Saved(id, result, label)),
-                );
-            }
-            Message::Saved(id, result, label) => {
-                self.saving = false;
-                if self.popup == Some(id) {
-                    if let Some(label) = label {
-                        self.shortcut = label;
-                    }
-                    match result {
-                        Ok(()) => {
-                            self.original_preferences = Some(self.preferences.clone());
-                            self.error = None;
-                            return self.close_popup();
-                        }
-                        Err(error) => self.settings_error = Some(error),
-                    }
-                } else if let Err(error) = result {
-                    // Dismissing an in-flight Save must not silently hide its failure.
-                    self.error = Some(error);
-                }
-            }
-            Message::Cancel if !self.saving => return self.close_popup(),
-            Message::Toggle
-            | Message::Settings
-            | Message::ConfirmRestart
-            | Message::Restart
-            | Message::ClosePopup(_)
-            | Message::Height(_)
-            | Message::Width(_)
-            | Message::AlwaysOnTop(_)
-            | Message::Save
-            | Message::Cancel
-            | Message::ShortcutLoaded(..)
-            | Message::ShortcutModifier(..)
-            | Message::ShortcutKey(_) => {}
-        }
-        Task::none()
+        let task = self.update_message(message);
+        self.sync_panel_guard();
+        task
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let icon = if self.error.is_some() {
+        let error = self.error.as_ref().or(self.panel_error.as_ref());
+        let icon = if error.is_some() {
             "dialog-warning-symbolic"
         } else {
             "utilities-terminal-symbolic"
         };
-        let button =
-            widget::mouse_area(self.core.applet.icon_button(icon).on_press(Message::Toggle))
-                .on_right_press(Message::Menu);
+        let mut icon_button = self.core.applet.icon_button(icon);
+        if self.can_toggle()
+            && let Some(generation) = self.panel_guard.acknowledged()
+        {
+            // Keep the native release-click button, but record only presses made
+            // after acknowledgement. Enabling during a held press cannot toggle.
+            icon_button = icon_button
+                .on_press_down(Message::IconPressed(generation))
+                .on_press(Message::Toggle);
+        }
+        let button = widget::mouse_area(icon_button)
+            .on_enter(Message::IconHovered(true))
+            .on_exit(Message::IconHovered(false))
+            .on_right_press(Message::Menu);
         self.core
             .applet
             .applet_tooltip::<Message>(
                 button,
-                self.error.clone().unwrap_or_else(|| {
+                error.cloned().unwrap_or_else(|| {
                     "Cosmos Dropdown Terminal · Right-click for Settings".into()
                 }),
                 self.popup.is_some(),
@@ -620,25 +728,27 @@ impl cosmic::Application for Applet {
     }
 
     fn on_escape(&mut self) -> Task<Message> {
-        self.close_popup()
+        let task = self.close_popup();
+        self.sync_panel_guard();
+        task
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if self.popup.is_none() {
-            return Subscription::none();
-        }
-        // Focused controls can capture Escape before libcosmic's navigation handler sees it.
-        iced::event::listen_raw(|event, _, id| {
-            if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        let events = iced::event::listen_raw(|event, _, id| match event {
+            iced::Event::Mouse(iced::mouse::Event::CursorEntered) => {
+                Some(Message::IconPointer(id, true))
+            }
+            iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
+                Some(Message::IconPointer(id, false))
+            }
+            // Focused controls can capture Escape before navigation sees it.
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
-            }) = event
-            {
-                Some(Message::ClosePopup(id))
-            } else {
-                None
-            }
-        })
+            }) => Some(Message::ClosePopup(id)),
+            _ => None,
+        });
+        Subscription::batch([events, self.panel_guard.subscription().map(Message::Panel)])
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
@@ -657,6 +767,9 @@ mod tests {
 
     fn applet() -> Applet {
         let preferences = Preferences::default();
+        let mut panel_guard = panel::Guard::default();
+        panel_guard.set_needed(true);
+        panel_guard.receive(&panel::Event::Ready(1));
         Applet {
             core: Core::default(),
             busy: false,
@@ -673,6 +786,11 @@ mod tests {
             shortcut_modifiers: Modifiers::LOGO,
             shortcut_key: "F12".into(),
             saving: false,
+            panel_guard,
+            panel_error: None,
+            panel_pressed: None,
+            icon_hovered: true,
+            backend_starting: false,
         }
     }
 
@@ -683,6 +801,7 @@ mod tests {
         let _ = applet.update(Message::Height(70));
         let _ = applet.update(Message::Width(60));
         let _ = applet.update(Message::AlwaysOnTop(false));
+        let _ = applet.update(Message::CloseOnFocusLoss(true));
         assert_eq!(applet.original_preferences.as_ref(), Some(&original));
         let _ = applet.update(Message::Cancel);
         assert_eq!(applet.preferences, original);
@@ -695,6 +814,7 @@ mod tests {
             let mut applet = applet();
             let original = applet.preferences.clone();
             let _ = applet.update(Message::Height(70));
+            let _ = applet.update(Message::CloseOnFocusLoss(true));
             let _ = applet.update(Message::ShortcutKey("F10".into()));
             if escape {
                 let _ = applet.on_escape();
@@ -726,11 +846,13 @@ mod tests {
         let mut applet = applet();
         let id = applet.popup.unwrap();
         let _ = applet.update(Message::Height(70));
+        let _ = applet.update(Message::CloseOnFocusLoss(true));
         applet.saving = true;
         let error = "Preferences saved, but the shortcut was not saved: conflict";
         let _ = applet.update(Message::Saved(id, Err(error.into()), None));
         assert_eq!(applet.popup, Some(id));
         assert_eq!(applet.preferences.dropdown_height_percent, 70);
+        assert!(applet.preferences.dropdown_close_on_focus_loss);
         assert_eq!(applet.settings_error.as_deref(), Some(error));
         assert!(!applet.saving);
     }
@@ -740,17 +862,22 @@ mod tests {
         let mut applet = applet();
         let id = applet.popup.unwrap();
         let _ = applet.update(Message::Height(70));
+        let _ = applet.update(Message::CloseOnFocusLoss(true));
         let _ = applet.update(Message::Saved(id, Ok(()), None));
         assert_eq!(applet.preferences.dropdown_height_percent, 70);
+        assert!(applet.preferences.dropdown_close_on_focus_loss);
         assert!(applet.popup.is_none());
     }
 
     #[test]
     fn cancel_cannot_undo_explicit_save_in_flight() {
         let mut applet = applet();
+        let _ = applet.update(Message::CloseOnFocusLoss(true));
         applet.saving = true;
         let id = applet.popup;
         let _ = applet.update(Message::Cancel);
+        let _ = applet.update(Message::CloseOnFocusLoss(false));
+        assert!(applet.preferences.dropdown_close_on_focus_loss);
         assert_eq!(applet.popup, id);
     }
 
@@ -790,15 +917,163 @@ mod tests {
         let mut applet = applet();
         applet.saving = true;
         let popup = applet.popup;
+        let _ = applet.update(Message::IconPressed(1));
         let _ = applet.update(Message::Toggle);
         assert!(!applet.busy);
         assert_eq!(applet.popup, popup);
         applet.saving = false;
+        let _ = applet.update(Message::IconPressed(1));
         let _ = applet.update(Message::Toggle);
         assert!(applet.busy);
         assert!(applet.popup.is_none());
         let _ = applet.update(Message::Toggle);
         assert!(applet.busy);
         assert!(applet.popup.is_none());
+    }
+
+    #[test]
+    fn a_press_before_guard_ack_cannot_become_a_click_after_enabling() {
+        let mut applet = applet();
+        applet.panel_guard.set_needed(false);
+        applet.sync_panel_guard();
+        let _ = applet.update(Message::IconPressed(2));
+        let _ = applet.update(Message::Panel(panel::Event::Ready(2)));
+        let _ = applet.update(Message::Toggle);
+        assert!(!applet.busy);
+        assert!(applet.popup.is_some());
+        let _ = applet.update(Message::IconPressed(2));
+        let _ = applet.update(Message::Toggle);
+        assert!(applet.busy);
+        assert!(applet.popup.is_none());
+        let _ = applet.update(Message::Completed(Ok(())));
+        let _ = applet.update(Message::Toggle);
+        assert!(
+            !applet.busy,
+            "One press and release must toggle exactly once"
+        );
+    }
+
+    #[test]
+    fn leaving_controls_revokes_old_presses_and_ignores_stale_guard_events() {
+        let mut applet = applet();
+        let _ = applet.update(Message::IconPressed(1));
+        let _ = applet.update(Message::IconHovered(false));
+        let _ = applet.update(Message::Cancel);
+        assert_eq!(applet.panel_guard.acknowledged(), None);
+        let _ = applet.update(Message::IconHovered(true));
+        let _ = applet.update(Message::Panel(panel::Event::Ready(1)));
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::Panel(panel::Event::Ready(2)));
+        let _ = applet.update(Message::Panel(panel::Event::Ended(1, Some("old".into()))));
+        assert!(applet.can_toggle());
+        assert!(applet.panel_error.is_none());
+        let _ = applet.update(Message::Toggle);
+        assert!(!applet.busy);
+        let _ = applet.update(Message::IconPressed(1));
+        let _ = applet.update(Message::Toggle);
+        assert!(!applet.busy);
+        let _ = applet.update(Message::IconPressed(2));
+        let _ = applet.update(Message::Toggle);
+        assert!(applet.busy);
+    }
+
+    #[test]
+    fn popup_transitions_keep_guard_and_closing_preserves_icon_hover() {
+        let mut applet = applet();
+        applet.core.set_main_window_id(Some(window::Id::unique()));
+        let _ = applet.update(Message::IconHovered(false));
+        assert_eq!(applet.panel_guard.acknowledged(), Some(1));
+        let old_popup = applet.popup;
+        let _ = applet.update(Message::ConfirmRestart);
+        assert_eq!(applet.page, Page::ConfirmRestart);
+        assert_ne!(applet.popup, old_popup);
+        assert_eq!(applet.panel_guard.acknowledged(), Some(1));
+        let _ = applet.update(Message::Settings);
+        assert_eq!(applet.page, Page::Settings);
+        assert_eq!(applet.panel_guard.acknowledged(), Some(1));
+        let _ = applet.update(Message::IconHovered(true));
+        let _ = applet.update(Message::Cancel);
+        assert!(applet.popup.is_none());
+        assert_eq!(applet.panel_guard.acknowledged(), Some(1));
+        let _ = applet.update(Message::IconHovered(false));
+        assert_eq!(applet.panel_guard.acknowledged(), None);
+    }
+
+    #[test]
+    fn menu_and_restart_remain_available_without_a_backend_guard() {
+        let mut applet = applet();
+        applet.core.set_main_window_id(Some(window::Id::unique()));
+        let _ = applet.update(Message::Cancel);
+        applet.panel_guard.set_needed(false);
+        applet.sync_panel_guard();
+        let _ = applet.update(Message::Menu);
+        assert_eq!(applet.page, Page::Menu);
+        assert!(applet.popup.is_some());
+        let _ = applet.update(Message::Panel(panel::Event::Ended(
+            2,
+            Some("backend cannot acknowledge guard".into()),
+        )));
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::ConfirmRestart);
+        assert_eq!(applet.page, Page::ConfirmRestart);
+        assert!(applet.popup.is_some());
+        let _ = applet.update(Message::Restart);
+        assert!(applet.backend_starting);
+        assert!(applet.busy);
+        assert!(applet.popup.is_none());
+    }
+
+    #[test]
+    fn restart_completion_reacquires_guard_without_accepting_old_replies() {
+        let mut applet = applet();
+        applet.page = Page::ConfirmRestart;
+        let _ = applet.update(Message::Restart);
+        assert!(applet.backend_starting);
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::Panel(panel::Event::Ready(1)));
+        assert_eq!(applet.panel_guard.acknowledged(), None);
+        let _ = applet.update(Message::BackendStarted(Ok(())));
+        assert!(!applet.backend_starting);
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::Panel(panel::Event::Ready(1)));
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::Panel(panel::Event::Ready(2)));
+        assert!(applet.can_toggle());
+    }
+
+    #[test]
+    fn initial_start_waits_for_completion_before_honoring_hover_demand() {
+        let mut applet = applet();
+        applet.popup = None;
+        applet.panel_guard = panel::Guard::default();
+        applet.backend_starting = true;
+        applet.busy = true;
+        let _ = applet.update(Message::IconHovered(true));
+        let _ = applet.update(Message::Panel(panel::Event::Ready(1)));
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::BackendStarted(Ok(())));
+        assert!(!applet.busy);
+        assert!(!applet.can_toggle());
+        let _ = applet.update(Message::Panel(panel::Event::Ready(1)));
+        assert!(applet.can_toggle());
+    }
+
+    #[test]
+    fn only_icon_surface_pointer_events_change_hover_demand() {
+        let mut applet = applet();
+        let icon = window::Id::unique();
+        let other = window::Id::unique();
+        applet.core.set_main_window_id(Some(icon));
+        applet.popup = None;
+        let _ = applet.update(Message::IconPointer(other, false));
+        assert_eq!(applet.panel_guard.acknowledged(), Some(1));
+        let _ = applet.update(Message::IconPointer(icon, false));
+        assert_eq!(applet.panel_guard.acknowledged(), None);
+        let _ = applet.update(Message::IconPointer(other, true));
+        let _ = applet.update(Message::Panel(panel::Event::Ready(2)));
+        assert_eq!(applet.panel_guard.acknowledged(), None);
+        let _ = applet.update(Message::IconPointer(icon, true));
+        let _ = applet.update(Message::Panel(panel::Event::Ready(2)));
+        assert_eq!(applet.panel_guard.acknowledged(), Some(2));
     }
 }

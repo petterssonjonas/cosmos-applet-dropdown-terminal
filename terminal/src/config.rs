@@ -257,6 +257,8 @@ pub struct Config {
     pub dropdown_width_percent: u8,
     #[serde(default = "default_dropdown_always_on_top")]
     pub dropdown_always_on_top: bool,
+    #[serde(default)]
+    pub dropdown_close_on_focus_loss: bool,
 }
 
 impl Default for Config {
@@ -286,6 +288,7 @@ impl Default for Config {
             dropdown_height_percent: default_dropdown_height_percent(),
             dropdown_width_percent: default_dropdown_width_percent(),
             dropdown_always_on_top: default_dropdown_always_on_top(),
+            dropdown_close_on_focus_loss: false,
         }
     }
 }

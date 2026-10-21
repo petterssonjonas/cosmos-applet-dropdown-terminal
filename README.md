@@ -95,6 +95,7 @@ Right-click the panel icon. Select **Settings**.
 | Height | 40% | Set the height as a percentage of the screen. |
 | Width | 100% | Set the width as a percentage of the screen. A narrow dropdown is centered. |
 | Always on top | On | Keep the dropdown above other windows without blocking their keyboard input. |
+| Close on focus loss | Off | Hide the dropdown when focus leaves it. Keep its shells and jobs running. |
 
 Height and width accept 1% to 100%. Select **Save** to apply edited settings to the open terminal. Select **Cancel**, press Escape or close the popup to discard unsaved edits. If Save reports an error, read the message: some fields may already be saved.
 
@@ -102,11 +103,19 @@ Use **Settings** to change the height and width. Mouse resizing is not supported
 
 To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Save**. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
 
-The terminal always opens at the top edge, above application windows and below reserved panel space. Turn **Always on top** off to let application windows cover it when it loses focus. If another application covers it, one shortcut press raises the dropdown and restores keyboard focus. The next shortcut press hides it. The panel icon works differently: a full left-click hides a visible dropdown or shows a hidden dropdown, even if another application covers it. The action runs when you release the mouse button. Changing the stacking layer does not change the position or size, create a normal window or close shells and tabs.
+The terminal opens at the top edge, above application windows and below reserved panel space. **Always on top** controls stacking only. With it off, clicking another application lets that application cover the dropdown. With it on, the dropdown stays above that application, but the application can receive keyboard input.
+
+**Close on focus loss** controls visibility separately. With it on, moving focus to another application hides the dropdown. With it off, the dropdown stays open, even if another application covers it.
+
+The applet icon and menu are exempt from focus-loss handling. Protection stays active while the pointer is over the icon or an applet menu is open. Leaving these controls restores the normal focus-loss policy. The icon becomes active after the backend confirms this protection. A full left-click toggles once, on release.
+
+The shortcut and icon both hide an open dropdown or show a hidden dropdown. An open dropdown that another window covers is still open: the first toggle hides it, and the next toggle shows it above other windows. These actions do not close shells or jobs.
 
 You can type when the dropdown appears. You do not need to click inside it first.
 
 The terminal's close button hides the dropdown. It does not stop the backend or close its shells. Click the panel icon or use the shortcut to show the same session again. Use **Restart** in the panel menu only when you want to close all sessions.
+
+Running `exit`, or pressing Ctrl+D in a shell that accepts it, closes that shell. If it was the last shell, the dropdown hides. The backend stays running. The next activation starts a new shell.
 
 ### Restart
 
@@ -126,7 +135,6 @@ Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, a **Copy fail
 
 ```sh
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend toggle
-~/.local/bin/cosmos-applet-dropdown-terminal-backend toggle-visibility
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend status
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend reload
 # WARNING: quit terminates shells and running jobs.
@@ -135,13 +143,15 @@ Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, a **Copy fail
 
 Removing the applet or installing an upgrade does not stop the backend. Finish its jobs, then select **Restart** from the panel icon menu. Remove and add the panel applet again to load the new click behavior and menu. Both the applet and backend must use the new version. If the installed applet has no Restart action, run `~/.local/bin/cosmos-applet-dropdown-terminal-backend quit` before adding it again. Restart and the `quit` command close all terminal shells. Logout also ends sessions. Do not restart the backend just to change settings: **Save** reloads preferences without closing shells.
 
+If an old backend cannot protect panel interaction, the icon shows a warning and left-click toggling stays disabled. The right-click menu remains available for Restart. If a very old terminal blocks that menu, hide it with the shortcut first. After finishing its jobs, you can also use the `quit` command above. Interacting with the applet can start a stopped backend in the background; it does not show the dropdown until you activate it.
+
 Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
 
 The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
 
-Checks in an isolated COSMIC session confirmed repeated left-click toggles, including separate mouse-down and release events, a covered dropdown and an open Settings popup. The backend process, shell process and shell variables stayed unchanged. Terminal rows and columns stayed unchanged across hide and show cycles. Before the fix, one cycle changed the row count from 12 to 60 and back to 12. The panel menu now contains only Settings and Restart. These checks do not cover every GPU or suspend path.
+Checks in an isolated COSMIC session covered all four combinations of Always on top and Close on focus loss. Other applications received keyboard input in every combination. Separate mouse-down and release checks confirmed one toggle per completed icon click. Moving the pointer away without changing focus did not hide the terminal. The backend process, shell process, shell variables and terminal dimensions stayed unchanged across normal toggles and focus-loss hiding.
 
-Live checks also confirmed changes to height, width and Always on top, a configured Super+F12 shortcut, Restart confirmation and Cancel. Normal toggles kept the same backend. Restart replaced it and opened a new dropdown. Strict Clippy checks, all 64 tests and the release build passed.
+Live checks also covered Save, Cancel, the applet-menu exemption, Super+F12, Restart, recovery after a stopped backend and release of an abandoned panel connection. Upgrade checks used a running older backend that rejected `panel-guard`; the new applet menu replaced it through Restart, after hiding the old terminal. `exit` and Ctrl+D closed the last shell and hid the dropdown; the next icon click started a new shell. Strict Clippy checks, all 82 tests and the release build passed. These checks do not cover every GPU or suspend path.
 
 ## Migration and removal
 
