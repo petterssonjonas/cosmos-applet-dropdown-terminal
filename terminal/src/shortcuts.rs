@@ -349,10 +349,7 @@ pub fn shortcut_groups() -> Vec<ShortcutGroup> {
     });
     groups.push(ShortcutGroup {
         title: fl!("shortcut-group-window"),
-        actions: vec![
-            KeyBindAction::WindowClose,
-            KeyBindAction::Settings,
-        ],
+        actions: vec![KeyBindAction::WindowClose, KeyBindAction::Settings],
     });
     groups.push(ShortcutGroup {
         title: fl!("shortcut-group-zoom"),

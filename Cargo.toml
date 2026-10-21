@@ -8,4 +8,5 @@ description = "Cosmos persistent native dropdown terminal applet for COSMIC"
 
 [dependencies]
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", default-features = false, features = ["applet", "applet-token", "dbus-config", "multi-window", "tokio", "wayland", "winit", "wgpu", "surface-message"] }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["process", "time"] }

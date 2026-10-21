@@ -316,9 +316,7 @@ fn client_inner(command: Command, ensure_running: bool) -> io::Result<()> {
             if matches!(
                 err.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-        }
+            ) => {}
         Err(err) => return Err(err),
     }
     if !ensure_running && matches!(command, Command::Status | Command::Hide | Command::Quit) {
@@ -360,9 +358,7 @@ fn client_inner(command: Command, ensure_running: bool) -> io::Result<()> {
                 if matches!(
                     err.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) && Instant::now() < deadline =>
-            {
-            }
+                ) && Instant::now() < deadline => {}
             Err(err) => return Err(err),
         }
         if let Some(status) = child.try_wait()?

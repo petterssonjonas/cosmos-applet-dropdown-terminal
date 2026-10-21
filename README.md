@@ -2,7 +2,11 @@
 
 A COSMIC panel applet with a persistent dropdown terminal. The included backend is adapted from [COSMIC Terminal](https://github.com/pop-os/cosmic-term). You do not need an external `cosmic-term` executable.
 
-Click the panel icon to show or hide the terminal. It uses the full output width and 40% of its logical height. It respects reserved panel space and does not move other windows. Hiding preserves shells, jobs, tabs, panes and scrollback. Closing the window hides it. Exiting the last shell ends that shell; the next show creates another.
+Click the panel icon to show or hide the terminal. Right-click the icon to open **Settings**.
+
+The terminal starts at 40% of the screen height and 100% of its width. It stays above other windows by default. Click the terminal to type. Click another window to give that window keyboard input. The terminal stays visible.
+
+Hiding keeps shells, jobs, tabs, panes and scrollback. Closing the window hides it. If you exit the last shell, the next show starts a new shell.
 
 ## Requirements
 
@@ -54,6 +58,12 @@ just install
 
 Use `sudo` only for system package prerequisites, never for `just build-release` or `just install`. Installation uses `~/.local/bin` and `~/.local/share`. It does not change panel entries or shortcuts. Use your mapped desktop user in a build container, not root.
 
+### Install a prebuilt archive
+
+Extract the archive and open its directory. Run `just install` as your desktop user. Do not run `just build-release` unless you want to rebuild. The archive includes the release executables in `target/release`.
+
+You need `just`, Bash, GNU coreutils and `desktop-file-utils` to install. Rust and development packages are not needed for a prebuilt install. The laptop must use the archive's CPU architecture and compatible system libraries. These executables are not statically linked. If a required library or GLIBC version is unavailable, build from source on the laptop.
+
 ## Enable and use
 
 In **COSMIC Settings → Desktop → Panel → Applets**, add **Cosmos Dropdown Terminal**. Reopen Settings or log in again if necessary. Close Settings, then explicitly enable **Super+§**:
@@ -62,7 +72,39 @@ In **COSMIC Settings → Desktop → Panel → Applets**, add **Cosmos Dropdown 
 just configure-shortcut
 ```
 
-Only one dropdown implementation can own this shortcut. Registration preserves other actions, saves a `custom.before-dropdown` backup and refuses conflicts. `§` means the XKB `section` symbol, not a fixed physical key. For another layout, set the shortcut manually to `/home/YOUR_USER/.local/bin/cosmos-applet-dropdown-terminal-backend toggle`.
+`just install` does not register a keyboard shortcut. Run `just configure-shortcut` in your desktop session, as your normal user, with COSMIC Settings closed. This uses **Super+§** when no shortcut is assigned. It keeps an existing shortcut for this terminal. COSMIC watches shortcut changes; a session restart is normally not needed. Reopen COSMIC Settings to refresh its list.
+
+To set the shortcut manually, open **Settings → Input devices → Keyboard → Keyboard shortcuts → View and customize shortcuts → Custom → Add shortcut**. Use **Cosmos Dropdown Terminal** as the name. Use this command, with your actual home directory:
+
+```text
+'/home/YOUR_USER/.local/bin/cosmos-applet-dropdown-terminal-backend' toggle
+```
+
+Keep the single quotes around the absolute executable path. The applet identifies its shortcut by this exact command. Do not use `~` or change the quoting. Focus **Type key combination**, press Super and the desired key, then release.
+
+Search for the action name in Keyboard shortcuts. COSMIC can display the binding as **Super+section**. Settings' global search does not list every custom binding. The `section` symbol is `§`; the printed keycap can differ from the symbol produced by your keyboard layout. Recording the combination in Settings uses your actual layout.
+
+Only one action can use a shortcut. Registration keeps other actions, saves a `custom.before-dropdown` backup and refuses conflicts. `§` means the XKB `section` symbol, not a fixed physical key.
+
+### Dropdown settings
+
+Right-click the panel icon. Select **Settings**.
+
+| Setting | Default | Use |
+| --- | --- | --- |
+| Height | 40% | Set the height as a percentage of the screen. |
+| Width | 100% | Set the width as a percentage of the screen. A narrow dropdown is centered. |
+| Always on top | On | Keep the dropdown above other windows without blocking their keyboard input. |
+
+Height and width accept 1% to 100%. Changes apply to an open terminal. Release a slider to save its value. Reserved panel space limits the maximum visible height. The bottom bar shows the actual percentage.
+
+Drag the bottom edge of the terminal to change its height. The bottom bar shows the current percentage. Release the mouse button to save the height.
+
+To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Apply keybinding**. Do not press the whole combination in the key field. Close COSMIC Settings before you apply a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
+
+Turn **Always on top** off to use a normal window. COSMIC then controls its position, size, tiling and stacking. It cannot be fixed to the top edge in this mode. Switching this setting keeps the same shells and tabs.
+
+### Backend controls
 
 ```sh
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend toggle
@@ -71,9 +113,11 @@ Only one dropdown implementation can own this shortcut. Registration preserves o
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend quit
 ```
 
-Removing the applet or installing an upgrade does not stop the backend. Finish jobs and use `quit` before starting an upgraded backend. Logout also ends sessions. Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
+Removing the applet or installing an upgrade does not stop the backend. Finish jobs and use `quit` before starting an upgraded backend. After an upgrade, remove and add the panel applet again to load its new menu. Logout also ends sessions. Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
 
-The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. There is no animation or session restoration after logout. Existing evidence includes repeated hide/show with preserved shell state and Super+§ in an isolated COSMIC session, not every GPU or suspend path.
+The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. There is no animation or session restoration after logout.
+
+Checks in an isolated COSMIC session covered settings, shortcut changes and conflicts, minimum and maximum sizes, live dragging, keyboard focus, both stacking modes and output resizing. The shell PID and environment stayed unchanged across surface changes. These checks do not cover every GPU or suspend path.
 
 ## Migration and removal
 

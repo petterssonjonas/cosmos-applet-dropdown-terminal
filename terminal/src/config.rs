@@ -17,6 +17,16 @@ pub const CONFIG_VERSION: u64 = 1;
 pub const COSMIC_THEME_DARK: &str = "COSMIC Dark";
 pub const COSMIC_THEME_LIGHT: &str = "COSMIC Light";
 
+fn default_dropdown_height_percent() -> u8 {
+    40
+}
+fn default_dropdown_width_percent() -> u8 {
+    100
+}
+fn default_dropdown_always_on_top() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum AppTheme {
     Dark,
@@ -241,6 +251,12 @@ pub struct Config {
     pub default_profile: Option<ProfileId>,
     #[serde(default)]
     pub shortcuts_custom: Shortcuts,
+    #[serde(default = "default_dropdown_height_percent")]
+    pub dropdown_height_percent: u8,
+    #[serde(default = "default_dropdown_width_percent")]
+    pub dropdown_width_percent: u8,
+    #[serde(default = "default_dropdown_always_on_top")]
+    pub dropdown_always_on_top: bool,
 }
 
 impl Default for Config {
@@ -267,6 +283,9 @@ impl Default for Config {
             use_bright_bold: false,
             default_profile: None,
             shortcuts_custom: Shortcuts::default(),
+            dropdown_height_percent: default_dropdown_height_percent(),
+            dropdown_width_percent: default_dropdown_width_percent(),
+            dropdown_always_on_top: default_dropdown_always_on_top(),
         }
     }
 }
