@@ -31,7 +31,7 @@ pub struct Dropdown {
     pub visible: bool,
     pub surface: Option<window::Id>,
     phase: Phase,
-    output_invalidated: bool,
+    surface_invalidated: bool,
     outputs: Vec<(WlOutput, OutputInfo)>,
     selected: Option<WlOutput>,
     height_percent: u8,
@@ -48,7 +48,7 @@ impl Default for Dropdown {
             visible: false,
             surface: None,
             phase: Phase::Absent,
-            output_invalidated: false,
+            surface_invalidated: false,
             outputs: Vec::new(),
             selected: None,
             height_percent: 40,
@@ -88,8 +88,19 @@ impl Dropdown {
         self.layer() != previous
     }
 
+    /// Return the toggle's requested visibility and prepare any surface replacement.
+    pub fn prepare_toggle(&mut self) -> bool {
+        let covered = self.visible && self.layer() == Layer::Bottom;
+        if covered {
+            // Remapping restores compositor focus without exclusive keyboard capture.
+            // Only the surface is replaced; terminal models and PTYs stay alive.
+            self.surface_invalidated |= self.surface.is_some();
+        }
+        !self.visible || covered
+    }
+
     pub fn begin_close(&mut self) -> Option<window::Id> {
-        if self.phase != Phase::Ready || (self.visible && !self.output_invalidated) {
+        if self.phase != Phase::Ready || (self.visible && !self.surface_invalidated) {
             return None;
         }
         self.phase = Phase::Closing;
@@ -121,12 +132,12 @@ impl Dropdown {
         if self.surface != Some(id) {
             return false;
         }
-        if self.phase != Phase::Closing && !self.output_invalidated {
+        if self.phase != Phase::Closing && !self.surface_invalidated {
             self.visible = false;
         }
         self.surface = None;
         self.phase = Phase::Absent;
-        self.output_invalidated = false;
+        self.surface_invalidated = false;
         true
     }
 
@@ -142,7 +153,7 @@ impl Dropdown {
         if removed {
             self.outputs.retain(|(id, _)| id != &output);
             if selected {
-                self.output_invalidated |= self.surface.is_some();
+                self.surface_invalidated |= self.surface.is_some();
                 self.selected = None;
             }
         } else if let Some(info) = info {
@@ -155,7 +166,7 @@ impl Dropdown {
         self.select_output();
         if before != self.output_size() || self.selected != previous_output {
             self.available_height = None;
-            self.output_invalidated |= self.surface.is_some();
+            self.surface_invalidated |= self.surface.is_some();
         }
         before != self.output_size() || (removed && selected)
     }
@@ -474,5 +485,40 @@ mod tests {
             (65, 55, false)
         );
         assert!(dropdown.settings().is_none());
+    }
+
+    #[test]
+    fn toggle_restores_covered_dropdown_then_hides_it_on_next_activation() {
+        let mut dropdown = Dropdown::default();
+        dropdown.configure(40, 100, false);
+        dropdown.visible = dropdown.prepare_toggle();
+        let old = window::Id::unique();
+        dropdown.begin_create(old);
+        assert!(dropdown.opened(old));
+        assert!(dropdown.set_raised(false));
+        dropdown.visible = dropdown.prepare_toggle();
+        dropdown.set_raised(true);
+        assert!(dropdown.visible);
+        assert_eq!(dropdown.begin_close(), Some(old));
+        assert!(dropdown.settings().is_none());
+        assert!(dropdown.surface_closed(old));
+        assert!(dropdown.visible);
+        let new = window::Id::unique();
+        dropdown.begin_create(new);
+        assert!(dropdown.opened(new));
+        assert_eq!(dropdown.layer(), Layer::Top);
+        dropdown.visible = dropdown.prepare_toggle();
+        assert!(!dropdown.visible);
+        assert_eq!(dropdown.begin_close(), Some(new));
+    }
+
+    #[test]
+    fn toggle_hides_pinned_dropdown_even_when_another_application_has_focus() {
+        let mut dropdown = Dropdown {
+            visible: true,
+            ..Default::default()
+        };
+        dropdown.set_raised(false);
+        assert!(!dropdown.prepare_toggle());
     }
 }

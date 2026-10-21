@@ -102,7 +102,7 @@ Use **Settings** to change the height and width. Mouse resizing is not supported
 
 To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Save**. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
 
-The terminal always opens at the top edge, above application windows and below reserved panel space. Turn **Always on top** off to let application windows cover it when it loses focus. Showing the dropdown raises it again. This changes its stacking layer, not its position or size. It does not become a normal window. Changing this setting keeps the same shells and tabs.
+The terminal always opens at the top edge, above application windows and below reserved panel space. Turn **Always on top** off to let application windows cover it when it loses focus. If another application covers it, one shortcut press or panel click raises the dropdown and restores keyboard focus. The next activation hides it. This changes its stacking layer, not its position or size. It does not become a normal window. Changing this setting keeps the same shells and tabs.
 
 The terminal's close button hides the dropdown. It does not stop the backend or close its shells. Click the panel icon or use the shortcut to show the same session again. Use **Restart** or **Quit** in the panel menu only when you want to close all sessions.
 

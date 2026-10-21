@@ -723,12 +723,16 @@ impl App {
                 };
             }
             Wayland::Layer(LayerEvent::Done, _, id) => return self.surface_closed(id),
-            Wayland::Layer(LayerEvent::Focused, _, id) if self.dropdown.surface == Some(id) => {
+            Wayland::Layer(LayerEvent::Focused, _, id)
+                if self.dropdown.surface == Some(id) && self.dropdown.ready() =>
+            {
                 return self
                     .set_dropdown_raised(true)
                     .chain(self.update(Message::WindowFocused));
             }
-            Wayland::Layer(LayerEvent::Unfocused, _, id) if self.dropdown.surface == Some(id) => {
+            Wayland::Layer(LayerEvent::Unfocused, _, id)
+                if self.dropdown.surface == Some(id) && self.dropdown.ready() =>
+            {
                 return self
                     .set_dropdown_raised(false)
                     .chain(self.update(Message::WindowUnfocused));
@@ -2221,7 +2225,10 @@ impl Application for App {
             Message::Control(request) => {
                 use control::Command;
                 let task = match request.command {
-                    Command::Toggle => self.set_dropdown_visible(!self.dropdown.visible),
+                    Command::Toggle => {
+                        let visible = self.dropdown.prepare_toggle();
+                        self.set_dropdown_visible(visible)
+                    }
                     Command::Show => self.set_dropdown_visible(true),
                     Command::Hide => self.set_dropdown_visible(false),
                     Command::Status => Task::none(),
