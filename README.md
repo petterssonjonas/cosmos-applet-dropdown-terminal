@@ -106,6 +106,15 @@ To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **
 
 Turn **Always on top** off to use a normal window. COSMIC then controls its position, size, tiling and stacking. It cannot be fixed to the top edge in this mode. Switching this setting keeps the same shells and tabs.
 
+### Restart or quit
+
+Right-click the panel icon. The menu has **Settings**, **Restart** and **Quit**.
+
+- **Restart** stops the terminal backend, then opens a new terminal with the installed version.
+- **Quit** stops the terminal backend. The panel icon stays in place. Click the icon or use the shortcut to start a new terminal.
+
+**Warning:** Restart and Quit close all terminal shells and running jobs. Finish your work first. Both actions ask for confirmation. Select **Cancel** to keep the terminal running. To keep your shells and jobs, hide the dropdown instead.
+
 ### Copy and paste
 
 Select terminal text. Use **Copy** in the right-click menu or press **Ctrl+Shift+C**. Paste into another application with that application's paste command. The backend keeps copied text available when you hide the dropdown or change its window mode. Another application can replace the clipboard contents normally.
@@ -122,13 +131,13 @@ Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, the bottom ba
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend quit
 ```
 
-Removing the applet or installing an upgrade does not stop the backend. An old backend can keep running with old resize or settings behavior. Finish its jobs, then run `~/.local/bin/cosmos-applet-dropdown-terminal-backend quit`. This closes its shells. Remove and add the panel applet again to load the new applet and backend. Logout also ends sessions. Do not stop the backend just to change settings: **Save** reloads preferences without closing shells.
+Removing the applet or installing an upgrade does not stop the backend. An old backend can keep running with old resize or settings behavior. Finish its jobs, then select **Restart** from the panel icon menu. Remove and add the panel applet again to load a new applet version. If the installed applet has no Restart action, run `~/.local/bin/cosmos-applet-dropdown-terminal-backend quit` before adding it again. Restart and Quit close all terminal shells. Logout also ends sessions. Do not restart the backend just to change settings: **Save** reloads preferences without closing shells.
 
 Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
 
 The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
 
-Checks in an isolated COSMIC session covered Save, Cancel, shortcut conflicts, minimum and maximum sizes, live dragging, keyboard focus, both stacking modes and output resizing. Copying from the context menu remained available after hiding the terminal and pasted into another application. Shell identity stayed unchanged across surface changes. A forced compositor crash stopped the backend without continued log growth. These checks do not cover every GPU or suspend path.
+Checks in an isolated COSMIC session covered Save, Cancel, shortcut conflicts, minimum and maximum sizes, live dragging, keyboard focus, both stacking modes and output resizing. Copying from the context menu remained available after hiding the terminal and pasted into another application. Shell identity stayed unchanged across surface changes. A forced compositor crash stopped the backend without continued log growth. Menu checks confirmed that Cancel kept the same backend, Restart replaced it, and Quit stopped it. The panel icon then started a new terminal. These checks do not cover every GPU or suspend path.
 
 ## Migration and removal
 

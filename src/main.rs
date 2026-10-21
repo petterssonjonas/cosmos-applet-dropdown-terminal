@@ -21,6 +21,22 @@ const MODIFIERS: [(Modifiers, &str); 4] = [
 enum Page {
     Menu,
     Settings,
+    ConfirmLifecycle(Lifecycle),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    Restart,
+    Quit,
+}
+
+impl Lifecycle {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Restart => "Restart",
+            Self::Quit => "Quit",
+        }
+    }
 }
 
 struct Applet {
@@ -48,6 +64,8 @@ enum Message {
     Surface(cosmic::surface::Action<Message>),
     Menu,
     Settings,
+    ConfirmLifecycle(Lifecycle),
+    RunLifecycle,
     ClosePopup(window::Id),
     Height(u8),
     Width(u8),
@@ -88,6 +106,16 @@ async fn control(command: &'static str) -> Result<(), String> {
         Ok(Err(error)) => Err(format!("Cannot start the terminal backend: {error}")),
         Err(_) => Err("Terminal control timed out after 40 seconds".into()),
     }
+}
+
+async fn lifecycle(action: Lifecycle) -> Result<(), String> {
+    // The quit command waits for the old backend to release its ownership lock.
+    // Never start a replacement if stopping the old backend failed.
+    control("quit").await?;
+    if action == Lifecycle::Restart {
+        control("show").await?;
+    }
+    Ok(())
 }
 
 async fn shortcut(binding: Option<(String, String)>) -> Result<String, String> {
@@ -407,7 +435,7 @@ impl cosmic::Application for Applet {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Toggle if !self.busy => {
+            Message::Toggle if !self.busy && !self.saving => {
                 self.busy = true;
                 return self
                     .close_popup()
@@ -432,7 +460,23 @@ impl cosmic::Application for Applet {
                     self.open_popup(Page::Menu)
                 };
             }
-            Message::Settings => return self.open_popup(Page::Settings),
+            Message::Settings if !self.busy && !self.saving => {
+                return self.open_popup(Page::Settings);
+            }
+            Message::ConfirmLifecycle(action) if !self.busy && !self.saving => {
+                return self.open_popup(Page::ConfirmLifecycle(action));
+            }
+            Message::RunLifecycle if !self.busy && !self.saving && self.popup.is_some() => {
+                if let Page::ConfirmLifecycle(lifecycle_action) = self.page {
+                    self.busy = true;
+                    self.error = None;
+                    return self
+                        .close_popup()
+                        .chain(iced::Task::perform(lifecycle(lifecycle_action), |result| {
+                            action::app(Message::Completed(result))
+                        }));
+                }
+            }
             Message::ClosePopup(id) if self.popup == Some(id) => return self.close_popup(),
             Message::Height(value) if !self.saving => {
                 self.preferences.dropdown_height_percent = value.clamp(1, 100);
@@ -509,6 +553,9 @@ impl cosmic::Application for Applet {
             }
             Message::Cancel if !self.saving => return self.close_popup(),
             Message::Toggle
+            | Message::Settings
+            | Message::ConfirmLifecycle(_)
+            | Message::RunLifecycle
             | Message::ClosePopup(_)
             | Message::Height(_)
             | Message::Width(_)
@@ -551,14 +598,45 @@ impl cosmic::Application for Applet {
         }
         let content = match self.page {
             Page::Menu => widget::container(
-                widget::button::text("Settings")
-                    .on_press(Message::Settings)
-                    .width(Length::Fill),
+                widget::column([
+                    widget::button::text("Settings")
+                        .on_press_maybe((!self.busy && !self.saving).then_some(Message::Settings))
+                        .width(Length::Fill)
+                        .into(),
+                    widget::button::text("Restart")
+                        .on_press_maybe((!self.busy && !self.saving)
+                            .then_some(Message::ConfirmLifecycle(Lifecycle::Restart)))
+                        .width(Length::Fill)
+                        .into(),
+                    widget::button::text("Quit")
+                        .on_press_maybe((!self.busy && !self.saving)
+                            .then_some(Message::ConfirmLifecycle(Lifecycle::Quit)))
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(4),
             )
             .padding(8)
             .width(200)
             .into(),
             Page::Settings => self.settings_view(),
+            Page::ConfirmLifecycle(lifecycle_action) => widget::container(
+                widget::column([
+                    widget::text::title3(format!("{} terminal?", lifecycle_action.label())).into(),
+                    widget::text("This closes all terminal shells and running jobs. Finish your work first.").into(),
+                    widget::text(match lifecycle_action {
+                        Lifecycle::Restart => "A new terminal opens with the installed backend. The panel icon stays in place.",
+                        Lifecycle::Quit => "The panel icon stays in place. Click it or use the shortcut to start the terminal again.",
+                    }).size(14).into(),
+                    widget::row([
+                        widget::Space::new().width(Length::Fill).into(),
+                        widget::button::standard("Cancel").on_press(Message::Cancel).into(),
+                        widget::button::destructive(lifecycle_action.label())
+                            .on_press_maybe((!self.busy && !self.saving).then_some(Message::RunLifecycle))
+                            .into(),
+                    ]).spacing(8).into(),
+                ]).spacing(12),
+            ).padding(16).width(380).into(),
         };
         self.core.applet.popup_container(content).into()
     }
@@ -700,5 +778,38 @@ mod tests {
         let id = applet.popup;
         let _ = applet.update(Message::Cancel);
         assert_eq!(applet.popup, id);
+    }
+
+    #[test]
+    fn lifecycle_requires_an_open_confirmation_and_cancel_revokes_it() {
+        for lifecycle_action in [Lifecycle::Restart, Lifecycle::Quit] {
+            let mut applet = applet();
+            let _ = applet.update(Message::RunLifecycle);
+            assert!(!applet.busy);
+            applet.page = Page::ConfirmLifecycle(lifecycle_action);
+            let _ = applet.update(Message::Cancel);
+            let _ = applet.update(Message::RunLifecycle);
+            assert!(!applet.busy);
+            assert!(applet.popup.is_none());
+        }
+    }
+
+    #[test]
+    fn confirmed_lifecycle_is_single_flight_and_waits_for_settings_save() {
+        let mut applet = applet();
+        applet.page = Page::ConfirmLifecycle(Lifecycle::Restart);
+        applet.saving = true;
+        let confirmation = applet.popup;
+        let _ = applet.update(Message::RunLifecycle);
+        assert!(!applet.busy);
+        assert_eq!(applet.popup, confirmation);
+        applet.saving = false;
+        let _ = applet.update(Message::RunLifecycle);
+        assert!(applet.busy);
+        assert!(applet.popup.is_none());
+        let _ = applet.update(Message::Toggle);
+        let _ = applet.update(Message::RunLifecycle);
+        assert!(applet.busy);
+        assert!(applet.popup.is_none());
     }
 }
