@@ -16,6 +16,9 @@ use cosmic::{
     },
 };
 
+pub const MIN_WIDTH: u32 = 96;
+pub const MIN_HEIGHT: u32 = 96;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Phase {
     #[default]
@@ -60,6 +63,7 @@ pub struct Dropdown {
     actual_size: Option<Size>,
     available_height: Option<u32>,
     drag: Option<ResizeDrag>,
+    resize_cancelled: bool,
 }
 
 impl Default for Dropdown {
@@ -78,6 +82,7 @@ impl Default for Dropdown {
             actual_size: None,
             available_height: None,
             drag: None,
+            resize_cancelled: false,
         }
     }
 }
@@ -87,11 +92,14 @@ impl Dropdown {
         let height = height.clamp(1, 100);
         let width = width.clamp(1, 100);
         let changed = (height, width, always_on_top)
-            != (self.height_percent, self.width_percent, self.always_on_top);
+            != (self.height_percent, self.width_percent, self.always_on_top)
+            || self.drag.is_some();
         if changed {
             self.height_percent = height;
             self.width_percent = width;
             self.always_on_top = always_on_top;
+            // Keep capturing until release, but never commit the interrupted preview.
+            self.resize_cancelled |= self.drag.take().is_some();
         }
         changed
     }
@@ -115,6 +123,7 @@ impl Dropdown {
             return None;
         }
         self.drag = None;
+        self.resize_cancelled = false;
         self.phase = Phase::Closing;
         self.surface
     }
@@ -154,6 +163,7 @@ impl Dropdown {
         self.output_invalidated = false;
         self.actual_size = None;
         self.drag = None;
+        self.resize_cancelled = false;
         true
     }
 
@@ -217,8 +227,13 @@ impl Dropdown {
     pub fn dimensions(&self) -> Option<(u32, u32)> {
         let (width, height) = self.output_size()?;
         Some((
-            percent_size(width, self.width_percent),
-            percent_size(height, self.height_percent()),
+            surface_dimension(width, self.width_percent, MIN_WIDTH, width),
+            surface_dimension(
+                height,
+                self.height_percent(),
+                MIN_HEIGHT,
+                self.available_height.unwrap_or(height),
+            ),
         ))
     }
 
@@ -260,7 +275,10 @@ impl Dropdown {
         } else {
             let mut settings = window::Settings {
                 size: Size::new(width as f32, height as f32),
-                min_size: Some(Size::new(1.0, 1.0)),
+                min_size: Some(Size::new(
+                    MIN_WIDTH.min(width) as f32,
+                    MIN_HEIGHT.min(height) as f32,
+                )),
                 decorations: false,
                 transparent: true,
                 exit_on_close_request: false,
@@ -276,6 +294,11 @@ impl Dropdown {
             return false;
         }
         self.actual_size = Some(size);
+        if self.role == SurfaceRole::Window
+            && let Some(drag) = &mut self.drag
+        {
+            drag.percent = resize_percent(size.height, drag.output_height);
+        }
         if self.role == SurfaceRole::Overlay && self.available_height.is_none() {
             self.available_height = Some(size.height.max(1.0).round() as u32);
             return true;
@@ -288,9 +311,6 @@ impl Dropdown {
     }
 
     pub fn displayed_height_percent(&self) -> u8 {
-        if self.resizing() {
-            return self.height_percent();
-        }
         match (self.actual_size, self.output_size()) {
             (Some(size), Some((_, height))) => resize_percent(size.height, height),
             _ => self.height_percent(),
@@ -298,7 +318,7 @@ impl Dropdown {
     }
 
     pub fn resizing(&self) -> bool {
-        self.drag.is_some()
+        self.drag.is_some() || self.resize_cancelled
     }
 
     pub fn start_resize(&mut self, id: window::Id, y: f32) {
@@ -312,6 +332,7 @@ impl Dropdown {
             || percent_size(output_height, self.height_percent) as f32,
             |size| size.height,
         );
+        self.resize_cancelled = false;
         self.drag = Some(ResizeDrag {
             start_y: y,
             last_y: y,
@@ -322,7 +343,7 @@ impl Dropdown {
     }
 
     pub fn drag_resize(&mut self, id: window::Id, y: f32) -> bool {
-        if self.surface != Some(id) {
+        if self.surface != Some(id) || self.role == SurfaceRole::Window {
             return false;
         }
         let Some(drag) = self.drag.as_mut() else {
@@ -339,6 +360,7 @@ impl Dropdown {
         if self.surface != Some(id) {
             return None;
         }
+        self.resize_cancelled = false;
         let drag = self.drag.take()?;
         if drag.percent == self.height_percent {
             return None;
@@ -350,6 +372,12 @@ impl Dropdown {
 
 fn percent_size(size: u32, percent: u8) -> u32 {
     ((u64::from(size) * u64::from(percent.clamp(1, 100)) + 50) / 100).max(1) as u32
+}
+
+fn surface_dimension(size: u32, percent: u8, minimum: u32, available: u32) -> u32 {
+    percent_size(size, percent)
+        .max(minimum)
+        .min(size.min(available))
 }
 
 fn resize_percent(height: f32, output_height: u32) -> u8 {
@@ -581,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn config_updates_keep_an_active_pointer_drag_until_release() {
+    fn saved_geometry_cancels_drag_and_cannot_be_overwritten_by_its_release() {
         let id = window::Id::unique();
         let mut dropdown = Dropdown {
             visible: true,
@@ -599,7 +627,74 @@ mod tests {
         assert!(dropdown.drag_resize(id, 600.0));
         assert!(dropdown.configure(50, 80, true));
         assert!(dropdown.resizing());
-        assert_eq!(dropdown.height_percent(), 60);
+        assert_eq!(dropdown.height_percent(), 50);
+        assert!(!dropdown.drag_resize(id, 800.0));
+        assert_eq!(dropdown.finish_resize(id), None);
+        assert!(!dropdown.resizing());
+        assert_eq!(dropdown.width_percent, 80);
+    }
+
+    #[test]
+    fn minimum_dimensions_keep_grip_accessible_without_exceeding_reserved_space() {
+        assert_eq!(surface_dimension(1920, 1, MIN_WIDTH, 1920), MIN_WIDTH);
+        assert_eq!(surface_dimension(800, 1, MIN_HEIGHT, 768), MIN_HEIGHT);
+        assert_eq!(surface_dimension(800, 100, MIN_HEIGHT, 768), 768);
+        assert_eq!(surface_dimension(80, 1, MIN_HEIGHT, 64), 64);
+    }
+
+    #[test]
+    fn saving_existing_geometry_also_cancels_preview() {
+        let id = window::Id::unique();
+        let mut dropdown = Dropdown {
+            surface: Some(id),
+            drag: Some(ResizeDrag {
+                start_y: 400.0,
+                last_y: 600.0,
+                start_height: 400.0,
+                output_height: 1000,
+                percent: 60,
+            }),
+            ..Default::default()
+        };
+        assert!(dropdown.configure(40, 100, true));
+        assert_eq!(dropdown.finish_resize(id), None);
+        assert_eq!(dropdown.height_percent(), 40);
+    }
+
+    #[test]
+    fn hidden_settings_change_all_dropdown_keys_without_creating_a_surface() {
+        let mut dropdown = Dropdown::default();
+        assert!(dropdown.configure(65, 55, false));
+        assert!(!dropdown.visible);
+        assert!(dropdown.surface.is_none());
+        assert_eq!(
+            (
+                dropdown.height_percent(),
+                dropdown.width_percent,
+                dropdown.requested_role()
+            ),
+            (65, 55, SurfaceRole::Window)
+        );
+        assert!(dropdown.settings().is_none());
+    }
+
+    #[test]
+    fn native_resize_commits_compositor_size_not_requested_pointer_delta() {
+        let id = window::Id::unique();
+        let mut dropdown = Dropdown {
+            surface: Some(id),
+            role: SurfaceRole::Window,
+            drag: Some(ResizeDrag {
+                start_y: 400.0,
+                last_y: 400.0,
+                start_height: 400.0,
+                output_height: 1000,
+                percent: 40,
+            }),
+            ..Default::default()
+        };
+        assert!(!dropdown.drag_resize(id, 900.0));
+        dropdown.resized(id, Size::new(800.0, 600.0));
         assert_eq!(dropdown.finish_resize(id), Some(60));
     }
 }

@@ -162,6 +162,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     let server = std::sync::Arc::new(server);
+    control::watch_display_disconnect()?;
 
     localize::localize();
 
@@ -233,13 +234,14 @@ fn print_help() {
         r#"Cosmos Dropdown Terminal
 Native Wayland dropdown terminal; configurable screen percentages, no animation.
 
-Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|quit|start]
+Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|reload|quit|start]
        cosmos-applet-dropdown-terminal-backend --daemon [-w DIR] [-e PROGRAM [ARGS...]]
 
   toggle (default)   Toggle visibility; start a backend if needed
   show               Show; start a backend if needed
   hide               Hide without terminating shells
   status             Print visible, hidden, or stopped
+  reload             Apply saved settings without showing or restarting the backend
   quit               Terminate backend and its shells
   start              Ensure a backend exists; leave visibility unchanged
   --daemon           Run the persistent backend in foreground, initially hidden
@@ -249,8 +251,8 @@ Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|quit|sta
   -V, --version      Show version
 
 Socket: $XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/control.sock
-Commands: toggle/show/hide/status/quit followed by newline.
-Replies: visible/hidden/bye, or error MESSAGE followed by newline.
+Commands: toggle/show/hide/status/reload/quit followed by newline.
+Replies: visible/hidden/reloaded/bye, or error MESSAGE followed by newline.
 First advertised usable output is selected; output changes resize the surface."#
     );
 }
@@ -390,8 +392,11 @@ pub enum Message {
     DropdownResizeStart(window::Id, f32),
     DropdownResizeMotion(window::Id, f32),
     DropdownResizeEnd(window::Id),
+    WindowResizing(window::Id, bool),
     AppTheme(AppTheme),
     QuitAcknowledged,
+    ReloadConfig,
+    ConfigReloaded(std::sync::mpsc::Sender<&'static str>),
     ClearScrollback(Option<segmented_button::Entity>),
     ColorSchemeCollapse,
     ColorSchemeDelete(ColorSchemeKind, ColorSchemeId),
@@ -407,6 +412,7 @@ pub enum Message {
     Copy(Option<segmented_button::Entity>),
     CopyOrSigint(Option<segmented_button::Entity>),
     CopyPrimary(Option<segmented_button::Entity>),
+    ClipboardResult(Result<(), String>),
     CopyUrlByMenu,
     DefaultBoldFontWeight(usize),
     DefaultDimFontWeight(usize),
@@ -515,6 +521,8 @@ struct ShortcutConflict {
 pub struct App {
     core: Core,
     dropdown: dropdown::Dropdown,
+    clipboard_failed: bool,
+    window_resize_active: bool,
     server: std::sync::Arc<control::Server>,
     about: About,
     pane_model: TerminalPaneGrid,
@@ -565,6 +573,25 @@ pub struct App {
     modifiers: Modifiers,
     #[cfg(feature = "password_manager")]
     password_mgr: password_manager::PasswordManager,
+}
+
+fn copy_selection(text: String, primary: bool) -> Task<Message> {
+    use wl_clipboard_rs::copy::{ClipboardType, MimeType, Options, Source};
+
+    let mut options = Options::new();
+    if primary {
+        options.clipboard(ClipboardType::Primary);
+    }
+    // Iced drops its clipboard owner when the last surface closes. A data-control
+    // owner serves this selection independently until it is replaced or we exit.
+    // Publish in event order before processing a subsequent hide or copy.
+    let result = options
+        .copy(
+            Source::Bytes(text.into_bytes().into_boxed_slice()),
+            MimeType::Text,
+        )
+        .map_err(|error| error.to_string());
+    Task::done(action::app(Message::ClipboardResult(result)))
 }
 
 impl App {
@@ -850,6 +877,25 @@ impl App {
             .set(self.core.window.show_context);
         self.shortcut_search_regex = None;
         self.shortcut_search_value.clear();
+    }
+
+    fn reload_config(&mut self) -> Result<Task<Message>, String> {
+        let handler = self.config_handler.as_ref().ok_or("no config handler")?;
+        let config = match Config::get_entry(handler) {
+            Ok(config) => config,
+            Err((errors, config)) => {
+                let errors: Vec<_> = errors
+                    .into_iter()
+                    .filter(|error| !matches!(error, cosmic_config::Error::NotFound))
+                    .map(|error| error.to_string())
+                    .collect();
+                if !errors.is_empty() {
+                    return Err(errors.join("; "));
+                }
+                config
+            }
+        };
+        Ok(self.update(Message::Config(Box::new(config))))
     }
 
     fn update_config(&mut self) -> Task<Message> {
@@ -2043,6 +2089,8 @@ impl Application for App {
         let mut app = Self {
             core,
             dropdown: dropdown::Dropdown::default(),
+            clipboard_failed: false,
+            window_resize_active: false,
             server: flags.server,
             about,
             pane_model,
@@ -2173,6 +2221,13 @@ impl Application for App {
         }
         match message {
             Message::QuitAcknowledged => return iced::exit(),
+            Message::ReloadConfig => match self.reload_config() {
+                Ok(task) => return task,
+                Err(error) => log::warn!("failed to reload config: {error}"),
+            },
+            Message::ConfigReloaded(reply) => {
+                let _ = reply.send("reloaded");
+            }
             Message::Control(request) => {
                 use control::Command;
                 let task = match request.command {
@@ -2180,6 +2235,18 @@ impl Application for App {
                     Command::Show => self.set_dropdown_visible(true),
                     Command::Hide => self.set_dropdown_visible(false),
                     Command::Status => Task::none(),
+                    Command::Reload => {
+                        return match self.reload_config() {
+                            Ok(task) => task.chain(Task::done(action::app(
+                                Message::ConfigReloaded(request.reply),
+                            ))),
+                            Err(error) => {
+                                log::warn!("failed to reload config: {error}");
+                                let _ = request.reply.send("error failed to reload config");
+                                Task::none()
+                            }
+                        };
+                    }
                     Command::Quit => {
                         let _ = request.reply.send("bye");
                         return Task::none();
@@ -2205,7 +2272,14 @@ impl Application for App {
                     return self.resize_dropdown_surface();
                 }
             }
-            Message::DropdownResizeStart(id, y) => self.dropdown.start_resize(id, y),
+            Message::DropdownResizeStart(id, y) => {
+                self.dropdown.start_resize(id, y);
+                if self.dropdown.role() == dropdown::SurfaceRole::Window && self.dropdown.resizing()
+                {
+                    self.window_resize_active = false;
+                    return window::drag_resize(id, window::Direction::South);
+                }
+            }
             Message::DropdownResizeMotion(id, y) => {
                 if self.dropdown.drag_resize(id, y) {
                     return self.resize_dropdown_surface();
@@ -2218,6 +2292,17 @@ impl Application for App {
                     }
                 } else {
                     return self.update(Message::CopyPrimary(None));
+                }
+            }
+            Message::WindowResizing(id, resizing) => {
+                if self.dropdown.surface == Some(id)
+                    && self.dropdown.role() == dropdown::SurfaceRole::Window
+                {
+                    let ended = self.window_resize_active && !resizing;
+                    self.window_resize_active = resizing;
+                    if ended && self.dropdown.resizing() {
+                        return self.update(Message::DropdownResizeEnd(id));
+                    }
                 }
             }
             Message::AppTheme(app_theme) => {
@@ -2433,7 +2518,12 @@ impl Application for App {
             Message::Config(mut config) => {
                 config.dropdown_height_percent = config.dropdown_height_percent.clamp(1, 100);
                 config.dropdown_width_percent = config.dropdown_width_percent.clamp(1, 100);
-                if *config != self.config {
+                let geometry_changed = self.dropdown.configure(
+                    config.dropdown_height_percent,
+                    config.dropdown_width_percent,
+                    config.dropdown_always_on_top,
+                );
+                let config = if *config != self.config {
                     let shortcuts_changed = config.shortcuts_custom != self.config.shortcuts_custom;
                     log::info!("update config");
                     //TODO: update syntax theme by clearing tabs, only if needed
@@ -2443,19 +2533,22 @@ impl Application for App {
                             shortcuts::ShortcutsConfig::new(self.config.shortcuts_custom.clone());
                         self.key_binds = key_binds(&self.shortcuts_config);
                     }
-                    let geometry_changed = self.dropdown.configure(
-                        self.config.dropdown_height_percent,
-                        self.config.dropdown_width_percent,
-                        self.config.dropdown_always_on_top,
-                    );
-                    let config = self.update_config();
-                    return if geometry_changed {
-                        config
-                            .chain(self.reconcile_dropdown())
-                            .chain(self.resize_dropdown_surface())
-                    } else {
-                        config
-                    };
+                    self.update_config()
+                } else {
+                    Task::none()
+                };
+                return if geometry_changed {
+                    config
+                        .chain(self.reconcile_dropdown())
+                        .chain(self.resize_dropdown_surface())
+                } else {
+                    config
+                };
+            }
+            Message::ClipboardResult(result) => {
+                self.clipboard_failed = result.is_err();
+                if let Err(error) = result {
+                    log::error!("Cannot copy terminal selection: {error}");
                 }
             }
             Message::Copy(entity_opt) => {
@@ -2465,7 +2558,9 @@ impl Application for App {
                         let terminal = terminal.lock().unwrap();
                         let term = terminal.term.lock();
                         if let Some(text) = term.selection_to_string() {
-                            return Task::batch([clipboard::write(text), self.update_focus()]);
+                            drop(term);
+                            drop(terminal);
+                            return Task::batch([copy_selection(text, false), self.update_focus()]);
                         }
                     }
                 } else {
@@ -2486,7 +2581,7 @@ impl Application for App {
                             // Mark as dirty
                             terminal.needs_update = true;
                             drop(terminal);
-                            return Task::batch([clipboard::write(text), self.update_focus()]);
+                            return Task::batch([copy_selection(text, false), self.update_focus()]);
                         } else {
                             // Drop the lock for term so that input_scroll doesn't block forever
                             drop(term);
@@ -2506,10 +2601,9 @@ impl Application for App {
                         let terminal = terminal.lock().unwrap();
                         let term = terminal.term.lock();
                         if let Some(text) = term.selection_to_string() {
-                            return Task::batch([
-                                clipboard::write_primary(text),
-                                self.update_focus(),
-                            ]);
+                            drop(term);
+                            drop(terminal);
+                            return Task::batch([copy_selection(text, true), self.update_focus()]);
                         }
                     }
                 } else {
@@ -2754,7 +2848,8 @@ impl Application for App {
                             terminal.active_regex_match = None;
                             terminal.needs_update = true;
 
-                            return Task::batch([clipboard::write(url), self.update_focus()]);
+                            drop(terminal);
+                            return Task::batch([copy_selection(url, false), self.update_focus()]);
                         }
                     }
                 }
@@ -3271,7 +3366,7 @@ impl Application for App {
                     TermEvent::ClipboardStore(kind, data) => match kind {
                         term::ClipboardType::Clipboard => {
                             log::info!("clipboard store");
-                            return clipboard::write(data);
+                            return copy_selection(data, false);
                         }
                         term::ClipboardType::Selection => {
                             log::info!("TODO: store selection");
@@ -3772,18 +3867,40 @@ impl Application for App {
         } else {
             pane_grid.into()
         };
-        let grip = widget::container(
-            widget::text(format!(
-                "Height: {}% — drag bottom edge",
-                self.dropdown.displayed_height_percent(),
-            ))
-            .size(12),
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(resize_grip::HEIGHT))
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .class(style::Container::Card);
+        let percent = self.dropdown.displayed_height_percent();
+        let resizing = self.dropdown.resizing();
+        let clipboard_failed = self.clipboard_failed;
+        let grip = widget::responsive(move |size| {
+            let label = if clipboard_failed {
+                "Copy failed — see backend log".into()
+            } else if size.width >= 320.0 {
+                format!("Height: {percent}% — drag to resize")
+            } else {
+                format!("{percent}%")
+            };
+            widget::container(widget::text(label).size(12))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .class(style::Container::custom(move |theme| {
+                    let cosmic = theme.cosmic();
+                    cosmic::iced::widget::container::Style {
+                        background: Some(iced::Background::Color(
+                            if resizing {
+                                cosmic.accent.hover_state_color()
+                            } else {
+                                cosmic.accent.base
+                            }
+                            .into(),
+                        )),
+                        text_color: Some(cosmic.accent.on.into()),
+                        ..Default::default()
+                    }
+                }))
+                .into()
+        })
+        .height(Length::Fixed(resize_grip::HEIGHT));
         let content = widget::column::with_children(vec![panes, grip.into()])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -3810,6 +3927,14 @@ impl Application for App {
         Subscription::batch([
             self.server.subscription(),
             event::listen_with(|event, _status, _window_id| match event {
+                Event::PlatformSpecific(iced::core::event::PlatformSpecific::Wayland(
+                    iced::core::event::wayland::Event::Window(
+                        iced::core::event::wayland::WindowEvent::WindowState(state),
+                    ),
+                )) => Some(Message::WindowResizing(
+                    _window_id,
+                    state.contains(cosmic::cctk::sctk::reexports::csd_frame::WindowState::RESIZING),
+                )),
                 Event::PlatformSpecific(iced::core::event::PlatformSpecific::Wayland(event)) => {
                     Some(Message::Wayland(event))
                 }
@@ -3852,7 +3977,7 @@ impl Application for App {
                     },
                 )
             }),
-            cosmic_config::config_subscription(
+            cosmic_config::config_subscription::<_, Config>(
                 TypeId::of::<ConfigSubscription>(),
                 Self::APP_ID.into(),
                 CONFIG_VERSION,
@@ -3865,7 +3990,8 @@ impl Application for App {
                         update.errors
                     );
                 }
-                Message::Config(Box::new(update.config))
+                // Read at dispatch time, not from a possibly queued partial-save snapshot.
+                Message::ReloadConfig
             }),
             match &self.dialog_opt {
                 Some(dialog) => dialog.subscription(),

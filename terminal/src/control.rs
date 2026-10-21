@@ -8,6 +8,7 @@ use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -19,12 +20,73 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub fn watch_display_disconnect() -> io::Result<()> {
+    let socket = if let Some(fd) = env::var_os("WAYLAND_SOCKET") {
+        let fd: i32 = fd
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid WAYLAND_SOCKET"))?;
+        // SAFETY: fcntl validates the descriptor; duplicating does not consume the
+        // descriptor that the GUI will take from WAYLAND_SOCKET.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful F_DUPFD_CLOEXEC returned a fresh, owned descriptor.
+        UnixStream::from(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    } else {
+        let display =
+            PathBuf::from(env::var_os("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into()));
+        let path = if display.is_absolute() {
+            display
+        } else {
+            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set")
+            })?)
+            .join(display)
+        };
+        UnixStream::connect(path)?
+    };
+    thread::Builder::new()
+        .name("wayland-lifetime".into())
+        .spawn(move || {
+            let result = wait_for_display_disconnect(socket);
+            eprintln!("Wayland connection closed; stopping terminal backend: {result:?}");
+            // libcosmic's SCTK loop currently logs fatal dispatch errors and continues.
+            // Its GUI executor cannot reliably process an exit task after disconnect.
+            // Process exit also releases the control lock and closes all PTY masters.
+            std::process::exit(1);
+        })?;
+    Ok(())
+}
+
+fn wait_for_display_disconnect(socket: UnixStream) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: descriptor points to one initialized pollfd; socket owns its fd
+        // throughout this call. Request no readable events: never consume GUI data.
+        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if result > 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Toggle,
     Show,
     Hide,
     Status,
+    Reload,
     Quit,
 }
 impl Command {
@@ -34,6 +96,7 @@ impl Command {
             "show" => Self::Show,
             "hide" => Self::Hide,
             "status" => Self::Status,
+            "reload" => Self::Reload,
             "quit" => Self::Quit,
             _ => return None,
         })
@@ -44,6 +107,7 @@ impl Command {
             Self::Show => "show",
             Self::Hide => "hide",
             Self::Status => "status",
+            Self::Reload => "reload",
             Self::Quit => "quit",
         }
     }
@@ -319,7 +383,12 @@ fn client_inner(command: Command, ensure_running: bool) -> io::Result<()> {
             ) => {}
         Err(err) => return Err(err),
     }
-    if !ensure_running && matches!(command, Command::Status | Command::Hide | Command::Quit) {
+    if !ensure_running
+        && matches!(
+            command,
+            Command::Status | Command::Hide | Command::Reload | Command::Quit
+        )
+    {
         println!("stopped");
         return Ok(());
     }
@@ -417,7 +486,7 @@ mod tests {
     }
     #[test]
     fn accepts_only_documented_commands() {
-        for name in ["toggle", "show", "hide", "status", "quit"] {
+        for name in ["toggle", "show", "hide", "status", "reload", "quit"] {
             assert_eq!(Command::parse(name).unwrap().name(), name);
         }
         assert_eq!(Command::parse("toggle show"), None);
@@ -484,5 +553,32 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         drop(owner);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn display_monitor_ignores_readable_data_and_finishes_on_disconnect() {
+        let (mut client, mut compositor) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let monitor = client.try_clone().unwrap();
+        let (closed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            closed.send(wait_for_display_disconnect(monitor)).unwrap();
+        });
+        compositor.write_all(b"wire").unwrap();
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let mut bytes = [0; 4];
+        client.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"wire");
+        drop(compositor);
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
 }

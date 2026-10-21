@@ -4,7 +4,8 @@ use cosmic::{
     iced::{
         Event, Length, Rectangle, Size, Vector,
         core::{
-            Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
+            Clipboard, Layout, Shell, Widget, layout, mouse, overlay,
+            renderer::{self, Renderer as _},
             widget::{Operation, Tree, tree},
         },
         window,
@@ -13,7 +14,7 @@ use cosmic::{
 
 use crate::Message;
 
-pub const HEIGHT: f32 = 24.0;
+pub const HEIGHT: f32 = 32.0;
 
 /// Captures the entire drag, including motion and release outside the grip.
 /// Wayland's implicit pointer grab keeps delivery on this surface until release.
@@ -110,7 +111,8 @@ impl Widget<Message, Theme, Renderer> for ResizeGrip<'_> {
         let dragging = &mut state.dragging;
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                if cursor.is_over(grip_bounds(layout.bounds())) =>
+                if grip_bounds(layout.bounds(), viewport)
+                    .is_some_and(|bounds| cursor.is_over(bounds)) =>
             {
                 if let Some(position) = cursor.position() {
                     *dragging = true;
@@ -159,7 +161,7 @@ impl Widget<Message, Theme, Renderer> for ResizeGrip<'_> {
         renderer: &Renderer,
     ) -> mouse::Interaction {
         if tree.state.downcast_ref::<State>().dragging
-            || cursor.is_over(grip_bounds(layout.bounds()))
+            || grip_bounds(layout.bounds(), viewport).is_some_and(|bounds| cursor.is_over(bounds))
         {
             mouse::Interaction::ResizingVertically
         } else {
@@ -192,6 +194,30 @@ impl Widget<Message, Theme, Renderer> for ResizeGrip<'_> {
             cursor,
             viewport,
         );
+        if let Some(bounds) = grip_bounds(layout.bounds(), viewport) {
+            let width = 20.0_f32.min(bounds.width);
+            let x = bounds.x + 8.0_f32.min((bounds.width - width) / 2.0);
+            let height = 2.0_f32.min(bounds.height);
+            let separation = 3.0_f32.min((bounds.height - height) / 2.0);
+            for offset in [-separation, separation] {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x,
+                            y: bounds.center_y() + offset - height / 2.0,
+                            width,
+                            height,
+                        },
+                        border: cosmic::iced::Border {
+                            radius: 1.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    cosmic::iced::Color::from(theme.cosmic().accent.on),
+                );
+            }
+        }
     }
 
     fn overlay<'b>(
@@ -224,11 +250,47 @@ impl Widget<Message, Theme, Renderer> for ResizeGrip<'_> {
     }
 }
 
-fn grip_bounds(bounds: Rectangle) -> Rectangle {
+fn grip_bounds(bounds: Rectangle, viewport: &Rectangle) -> Option<Rectangle> {
+    let bounds = bounds.intersection(viewport)?;
     let height = HEIGHT.min(bounds.height);
-    Rectangle {
+    Some(Rectangle {
         y: bounds.y + bounds.height - height,
         height,
         ..bounds
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grip_hit_target_stays_inside_the_visible_short_content() {
+        let viewport = Rectangle::new(cosmic::iced::Point::ORIGIN, Size::new(96.0, 80.0));
+        let bounds = Rectangle {
+            x: 1.0,
+            y: 48.0,
+            width: 94.0,
+            height: 96.0,
+        };
+        assert_eq!(
+            grip_bounds(bounds, &viewport),
+            Some(Rectangle {
+                height: 32.0,
+                ..bounds
+            })
+        );
+    }
+
+    #[test]
+    fn content_outside_viewport_has_no_grip_hit_target() {
+        let viewport = Rectangle::new(cosmic::iced::Point::ORIGIN, Size::new(96.0, 32.0));
+        let bounds = Rectangle {
+            x: 1.0,
+            y: 48.0,
+            width: 94.0,
+            height: 96.0,
+        };
+        assert_eq!(grip_bounds(bounds, &viewport), None);
     }
 }

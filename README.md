@@ -10,7 +10,7 @@ Hiding keeps shells, jobs, tabs, panes and scrollback. Closing the window hides 
 
 ## Requirements
 
-Runtime: a COSMIC Wayland session with layer-shell support, working graphics drivers and terminal fonts. There is no X11 fallback. No Python process is needed at runtime.
+Runtime: a COSMIC Wayland session with layer-shell and data-control clipboard support, working graphics drivers and terminal fonts. There is no X11 fallback. No Python process or external clipboard command is needed at runtime.
 
 Build/install: current stable Rust from [rustup](https://rustup.rs), `just`, Bash, GNU coreutils/findutils, Git and the native development packages below. Distribution Rust packages can be too old. These are package examples, not a claim that all distributions were tested.
 
@@ -96,28 +96,39 @@ Right-click the panel icon. Select **Settings**.
 | Width | 100% | Set the width as a percentage of the screen. A narrow dropdown is centered. |
 | Always on top | On | Keep the dropdown above other windows without blocking their keyboard input. |
 
-Height and width accept 1% to 100%. Changes apply to an open terminal. Release a slider to save its value. Reserved panel space limits the maximum visible height. The bottom bar shows the actual percentage.
+Height and width accept 1% to 100%. Select **Save** to apply edited settings to the open terminal. Select **Cancel**, press Escape or close the popup to discard unsaved edits. If Save reports an error, read the message: some fields may already be saved.
 
-Drag the bottom edge of the terminal to change its height. The bottom bar shows the current percentage. Release the mouse button to save the height.
+The terminal has a minimum size of 96 × 96 logical pixels so the resize handle remains available. The screen and reserved panel space limit its size. The bottom bar shows the actual height percentage.
 
-To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Apply keybinding**. Do not press the whole combination in the key field. Close COSMIC Settings before you apply a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
+Drag the colored bar at the bottom of the terminal to change its height. The bar has a grip mark and a live percentage. Release the mouse button to save the height.
+
+To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Save**. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
 
 Turn **Always on top** off to use a normal window. COSMIC then controls its position, size, tiling and stacking. It cannot be fixed to the top edge in this mode. Switching this setting keeps the same shells and tabs.
+
+### Copy and paste
+
+Select terminal text. Use **Copy** in the right-click menu or press **Ctrl+Shift+C**. Paste into another application with that application's paste command. The backend keeps copied text available when you hide the dropdown or change its window mode. Another application can replace the clipboard contents normally.
+
+Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, the bottom bar shows **Copy failed**. The backend log contains the error.
 
 ### Backend controls
 
 ```sh
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend toggle
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend status
+~/.local/bin/cosmos-applet-dropdown-terminal-backend reload
 # WARNING: quit terminates shells and running jobs.
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend quit
 ```
 
-Removing the applet or installing an upgrade does not stop the backend. Finish jobs and use `quit` before starting an upgraded backend. After an upgrade, remove and add the panel applet again to load its new menu. Logout also ends sessions. Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
+Removing the applet or installing an upgrade does not stop the backend. An old backend can keep running with old resize or settings behavior. Finish its jobs, then run `~/.local/bin/cosmos-applet-dropdown-terminal-backend quit`. This closes its shells. Remove and add the panel applet again to load the new applet and backend. Logout also ends sessions. Do not stop the backend just to change settings: **Save** reloads preferences without closing shells.
 
-The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. There is no animation or session restoration after logout.
+Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
 
-Checks in an isolated COSMIC session covered settings, shortcut changes and conflicts, minimum and maximum sizes, live dragging, keyboard focus, both stacking modes and output resizing. The shell PID and environment stayed unchanged across surface changes. These checks do not cover every GPU or suspend path.
+The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
+
+Checks in an isolated COSMIC session covered Save, Cancel, shortcut conflicts, minimum and maximum sizes, live dragging, keyboard focus, both stacking modes and output resizing. Copying from the context menu remained available after hiding the terminal and pasted into another application. Shell identity stayed unchanged across surface changes. A forced compositor crash stopped the backend without continued log growth. These checks do not cover every GPU or suspend path.
 
 ## Migration and removal
 

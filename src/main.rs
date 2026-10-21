@@ -2,12 +2,10 @@
 mod settings;
 
 use cosmic::app::{Core, Task};
-use cosmic::cosmic_config::{self, ConfigSet};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::{self, Alignment, Length, Limits, Subscription, keyboard::Modifiers, window};
 use cosmic::{Element, action, widget};
 use settings::Preferences;
-use std::any::TypeId;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -32,14 +30,15 @@ struct Applet {
     popup: Option<window::Id>,
     page: Page,
     preferences: Preferences,
-    height_dirty: bool,
-    width_dirty: bool,
+    original_preferences: Option<Preferences>,
     settings_error: Option<String>,
     shortcut_error: Option<String>,
     shortcut: String,
     shortcut_busy: bool,
+    shortcut_edited: bool,
     shortcut_modifiers: Modifiers,
     shortcut_key: String,
+    saving: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -50,16 +49,15 @@ enum Message {
     Menu,
     Settings,
     ClosePopup(window::Id),
-    Preferences(Preferences),
     Height(u8),
-    SaveHeight,
     Width(u8),
-    SaveWidth,
     AlwaysOnTop(bool),
     ShortcutModifier(Modifiers, bool),
     ShortcutKey(String),
-    SaveShortcut,
-    ShortcutCompleted(Result<String, String>),
+    ShortcutLoaded(window::Id, Result<String, String>),
+    Save,
+    Cancel,
+    Saved(window::Id, Result<(), String>, Option<String>),
 }
 
 // Resolve installed siblings first; a panel's PATH need not include ~/.local/bin.
@@ -125,10 +123,69 @@ async fn shortcut(binding: Option<(String, String)>) -> Result<String, String> {
     }
 }
 
+async fn save_settings(
+    original: Preferences,
+    draft: Preferences,
+    binding: Option<(String, String, String)>,
+) -> (Result<(), String>, Option<String>) {
+    // Check for external shortcut edits before writing either configuration.
+    if let Some((_, _, expected)) = &binding {
+        let current = match shortcut(None).await {
+            Ok(current) => current,
+            Err(error) => {
+                return (
+                    Err(format!(
+                        "Nothing saved. Cannot read current shortcut: {error}"
+                    )),
+                    None,
+                );
+            }
+        };
+        if current != *expected {
+            return (Err("Nothing saved. The shortcut changed outside this dialog. Cancel and reopen settings before saving.".into()), None);
+        }
+    }
+    let mut errors = Vec::new();
+    let mut saved_shortcut = None;
+    if let Err(error) = settings::save(&original, &draft) {
+        errors.push(format!(
+            "Cannot save preferences; some keys may have been saved: {error}"
+        ));
+    } else if let Some((modifiers, key, _)) = binding {
+        match shortcut(Some((modifiers, key))).await {
+            Ok(label) => saved_shortcut = Some(label),
+            Err(error) => errors.push(format!(
+                "Preferences saved, but the shortcut was not saved: {error}"
+            )),
+        }
+    }
+    // Explicit reload acknowledges visible application, rather than trusting file-watch timing.
+    if let Err(error) = control("reload").await {
+        errors.push(format!(
+            "Cannot apply saved preferences to the terminal: {error}\n\
+             If an older backend is still running, finish running shell jobs, then restart the backend. \
+             Restarting closes its shells; this dialog does not stop them automatically."
+        ));
+    }
+    if errors.is_empty() {
+        (Ok(()), saved_shortcut)
+    } else {
+        (Err(errors.join("\n")), saved_shortcut)
+    }
+}
+
 impl Applet {
     fn close_popup(&mut self) -> Task<Message> {
-        self.height_dirty = false;
-        self.width_dirty = false;
+        if let Some(original) = &self.original_preferences {
+            self.preferences = original.clone();
+        }
+        if self.shortcut_edited {
+            self.shortcut_edited = false;
+            self.shortcut_modifiers = Modifiers::LOGO;
+            self.shortcut_key.clear();
+            self.shortcut_key.push('§');
+            self.receive_shortcut(self.shortcut.clone());
+        }
         match self.popup.take() {
             Some(id) => destroy_popup(id),
             None => Task::none(),
@@ -154,67 +211,55 @@ impl Applet {
             .max_height(560.0);
         let open = close.chain(get_popup(popup));
         if page == Page::Settings {
-            match settings::load() {
-                Ok(preferences) => self.receive_preferences(preferences),
-                Err(error) => self.settings_error = Some(error),
-            }
-            if !self.shortcut_busy {
-                self.shortcut_busy = true;
-                return Task::batch([
-                    open,
-                    iced::Task::perform(shortcut(None), |result| {
-                        action::app(Message::ShortcutCompleted(result))
-                    }),
-                ]);
-            }
+            self.settings_error = None;
+            self.shortcut_error = None;
+            self.original_preferences = match settings::load() {
+                Ok(preferences) => {
+                    self.preferences = preferences.clone();
+                    Some(preferences)
+                }
+                Err(error) => {
+                    self.settings_error = Some(format!("Cannot read settings: {error}"));
+                    None
+                }
+            };
+            self.shortcut = "Unassigned".into();
+            self.shortcut_modifiers = Modifiers::LOGO;
+            self.shortcut_key = "§".into();
+            self.shortcut_busy = true;
+            return Task::batch([
+                open,
+                iced::Task::perform(shortcut(None), move |result| {
+                    action::app(Message::ShortcutLoaded(id, result))
+                }),
+            ]);
         }
         open
     }
 
-    fn receive_preferences(&mut self, preferences: Preferences) {
-        if !self.height_dirty {
-            self.preferences.dropdown_height_percent =
-                preferences.dropdown_height_percent.clamp(1, 100);
-        }
-        if !self.width_dirty {
-            self.preferences.dropdown_width_percent =
-                preferences.dropdown_width_percent.clamp(1, 100);
-        }
-        self.preferences.dropdown_always_on_top = preferences.dropdown_always_on_top;
-    }
-
-    fn save_percent(&mut self, height: bool) {
-        let (key, value) = if height {
-            (
-                "dropdown_height_percent",
-                self.preferences.dropdown_height_percent,
-            )
-        } else {
-            (
-                "dropdown_width_percent",
-                self.preferences.dropdown_width_percent,
-            )
-        };
-        let result = cosmic_config::Config::new(settings::CONFIG_ID, settings::CONFIG_VERSION)
-            .and_then(|config| config.set(key, value));
-        match result {
-            Ok(()) => {
-                self.settings_error = None;
-                if height {
-                    self.height_dirty = false;
-                } else {
-                    self.width_dirty = false;
+    fn receive_shortcut(&mut self, label: String) {
+        // A late read may update the saved label, never an edited draft.
+        if !self.shortcut_edited && label != "Unassigned" {
+            self.shortcut_modifiers = Modifiers::empty();
+            let mut parts = label.split('+').peekable();
+            while let Some(part) = parts.next() {
+                if parts.peek().is_none() {
+                    self.shortcut_key = part.into();
+                } else if let Some(&(modifier, _)) =
+                    MODIFIERS.iter().find(|(_, name)| *name == part)
+                {
+                    self.shortcut_modifiers.insert(modifier);
                 }
             }
-            Err(error) => self.settings_error = Some(format!("Cannot save settings: {error}")),
         }
+        self.shortcut = label;
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
         let height = self.preferences.dropdown_height_percent;
         let width = self.preferences.dropdown_width_percent;
         let shortcut_label = if self.shortcut_busy {
-            "Reading or saving shortcut…"
+            "Reading shortcut…"
         } else {
             &self.shortcut
         };
@@ -224,26 +269,21 @@ impl Applet {
                 .size(16)
                 .text_size(14)
                 .on_toggle_maybe(
-                    (!self.shortcut_busy)
+                    (!self.saving)
                         .then_some(move |enabled| Message::ShortcutModifier(modifier, enabled)),
                 )
                 .into()
         }))
         .spacing(12);
         let mut key = widget::text_input("§, F12, grave…", &self.shortcut_key);
-        if !self.shortcut_busy {
+        if !self.saving {
             key = key.on_input(Message::ShortcutKey);
         }
-        let save = widget::button::text("Apply keybinding")
-            .on_press_maybe((!self.shortcut_busy).then_some(Message::SaveShortcut));
         let mut shortcut_controls = widget::column([
             widget::text("Global keybinding").into(),
             widget::text(shortcut_label).size(14).into(),
             modifiers.into(),
-            widget::row([key.into(), save.into()])
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .into(),
+            key.into(),
             widget::text("Enter a character or XKB key name. Do not press the whole combination.")
                 .size(12)
                 .into(),
@@ -253,29 +293,73 @@ impl Applet {
             shortcut_controls =
                 shortcut_controls.push(widget::text(format!("Error: {error}")).size(14));
         }
-        let mut content = widget::column([
+        let content = widget::column([
             widget::text::title3("Dropdown settings").into(),
             shortcut_controls.into(),
             widget::divider::horizontal::default().into(),
             widget::text(format!("Height: {height}% of screen")).into(),
-            widget::slider(1..=100, height, Message::Height).on_release(Message::SaveHeight).into(),
+            widget::slider(1..=100, height, Message::Height).into(),
             widget::text(format!("Width: {width}% of screen")).into(),
-            widget::slider(1..=100, width, Message::Width).on_release(Message::SaveWidth).into(),
+            widget::slider(1..=100, width, Message::Width).into(),
             widget::row([
                 widget::text("Always on top").width(Length::Fill).into(),
-                widget::toggler(self.preferences.dropdown_always_on_top).on_toggle(Message::AlwaysOnTop).into(),
-            ]).align_y(Alignment::Center).spacing(12).into(),
-            widget::text("Off uses a normal window. COSMIC controls its position and stacking.").size(12).into(),
-            widget::text("Drag the terminal's bottom edge to change its height. Changes are saved automatically.").size(12).into(),
-        ]).spacing(12).width(Length::Fill);
+                widget::toggler(self.preferences.dropdown_always_on_top)
+                    .on_toggle(Message::AlwaysOnTop)
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(12)
+            .into(),
+            widget::text(
+                "Off uses a normal window. COSMIC controls its size, position and stacking.",
+            )
+            .size(12)
+            .into(),
+            widget::text(
+                "Save applies these settings and the edited shortcut. Cancel discards edits.",
+            )
+            .size(12)
+            .into(),
+            widget::text("Release the terminal's bottom resize handle to save its height.")
+                .size(12)
+                .into(),
+        ])
+        .spacing(12)
+        .width(Length::Fill);
+        let actions = widget::row([
+            widget::Space::new().width(Length::Fill).into(),
+            widget::button::standard("Cancel")
+                .on_press_maybe((!self.saving).then_some(Message::Cancel))
+                .into(),
+            widget::button::suggested(if self.saving { "Saving…" } else { "Save" })
+                .on_press_maybe(
+                    (!self.saving && !self.shortcut_busy && self.original_preferences.is_some())
+                        .then_some(Message::Save),
+                )
+                .into(),
+        ])
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let mut footer = widget::column::with_capacity(2).spacing(8);
         if let Some(error) = &self.settings_error {
-            content = content.push(widget::text(format!("Error: {error}")).size(14));
+            footer = footer.push(
+                widget::scrollable(widget::text(format!("Error: {error}")).size(14)).height(108),
+            );
         }
-        widget::container(widget::scrollable(content))
-            .padding(16)
-            .width(380)
-            .max_height(560)
-            .into()
+        let footer = footer.push(actions);
+        // Only the fields scroll; actions remain reachable at the popup's height limit.
+        widget::container(
+            widget::column([
+                widget::scrollable(content).height(Length::Fill).into(),
+                widget::divider::horizontal::default().into(),
+                footer.into(),
+            ])
+            .spacing(12),
+        )
+        .padding(16)
+        .width(380)
+        .height(560)
+        .into()
     }
 }
 
@@ -304,15 +388,16 @@ impl cosmic::Application for Applet {
                 error: None,
                 popup: None,
                 page: Page::Menu,
+                original_preferences: Some(preferences.clone()),
                 preferences,
-                height_dirty: false,
-                width_dirty: false,
                 settings_error,
                 shortcut_error: None,
                 shortcut: "Unassigned".into(),
                 shortcut_busy: false,
+                shortcut_edited: false,
                 shortcut_modifiers: Modifiers::LOGO,
                 shortcut_key: "§".into(),
+                saving: false,
             },
             iced::Task::perform(control("start"), |result| {
                 action::app(Message::Completed(result))
@@ -349,77 +434,88 @@ impl cosmic::Application for Applet {
             }
             Message::Settings => return self.open_popup(Page::Settings),
             Message::ClosePopup(id) if self.popup == Some(id) => return self.close_popup(),
-            Message::Preferences(preferences) => self.receive_preferences(preferences),
-            Message::Height(value) => {
+            Message::Height(value) if !self.saving => {
                 self.preferences.dropdown_height_percent = value.clamp(1, 100);
-                self.height_dirty = true;
             }
-            Message::SaveHeight => self.save_percent(true),
-            Message::Width(value) => {
+            Message::Width(value) if !self.saving => {
                 self.preferences.dropdown_width_percent = value.clamp(1, 100);
-                self.width_dirty = true;
             }
-            Message::SaveWidth => self.save_percent(false),
-            Message::AlwaysOnTop(value) => {
-                match cosmic_config::Config::new(settings::CONFIG_ID, settings::CONFIG_VERSION)
-                    .and_then(|config| config.set("dropdown_always_on_top", value))
-                {
-                    Ok(()) => {
-                        self.preferences.dropdown_always_on_top = value;
-                        self.settings_error = None;
-                    }
-                    Err(error) => {
-                        self.settings_error = Some(format!("Cannot save settings: {error}"))
-                    }
-                }
+            Message::AlwaysOnTop(value) if !self.saving => {
+                self.preferences.dropdown_always_on_top = value;
             }
-            Message::ShortcutModifier(modifier, enabled) if !self.shortcut_busy => {
+            Message::ShortcutModifier(modifier, enabled) if !self.saving => {
                 self.shortcut_modifiers.set(modifier, enabled);
+                self.shortcut_edited = true;
             }
-            Message::ShortcutKey(key) if !self.shortcut_busy => self.shortcut_key = key,
-            Message::SaveShortcut if !self.shortcut_busy => {
-                let mut modifiers = String::new();
-                for (modifier, name) in MODIFIERS {
-                    if self.shortcut_modifiers.contains(modifier) {
-                        if !modifiers.is_empty() {
-                            modifiers.push(',');
-                        }
-                        modifiers.push_str(name);
-                    }
-                }
-                self.shortcut_busy = true;
-                self.shortcut_error = None;
-                return iced::Task::perform(
-                    shortcut(Some((modifiers, self.shortcut_key.clone()))),
-                    |result| action::app(Message::ShortcutCompleted(result)),
-                );
+            Message::ShortcutKey(key) if !self.saving => {
+                self.shortcut_key = key;
+                self.shortcut_edited = true;
             }
-            Message::ShortcutCompleted(result) => {
+            Message::ShortcutLoaded(id, result) if self.popup == Some(id) => {
                 self.shortcut_busy = false;
                 match result {
-                    Ok(label) => {
-                        if label != "Unassigned" {
-                            self.shortcut_modifiers = Modifiers::empty();
-                            let mut parts = label.split('+').peekable();
-                            while let Some(part) = parts.next() {
-                                if parts.peek().is_none() {
-                                    self.shortcut_key = part.into();
-                                } else if let Some(&(modifier, _)) =
-                                    MODIFIERS.iter().find(|(_, name)| *name == part)
-                                {
-                                    self.shortcut_modifiers.insert(modifier);
-                                }
-                            }
-                        }
-                        self.shortcut = label;
-                        self.shortcut_error = None;
-                    }
+                    Ok(label) => self.receive_shortcut(label),
                     Err(error) => self.shortcut_error = Some(error),
                 }
             }
+            Message::Save if !self.saving && !self.shortcut_busy => {
+                let (Some(id), Some(original)) = (self.popup, &self.original_preferences) else {
+                    return Task::none();
+                };
+                if self.shortcut_edited && self.shortcut_error.is_some() {
+                    self.settings_error = Some(
+                        "Cannot safely replace an unread shortcut. Cancel and reopen settings to retry."
+                            .into(),
+                    );
+                    return Task::none();
+                }
+                let binding = self.shortcut_edited.then(|| {
+                    let mut modifiers = String::new();
+                    for (modifier, name) in MODIFIERS {
+                        if self.shortcut_modifiers.contains(modifier) {
+                            if !modifiers.is_empty() {
+                                modifiers.push(',');
+                            }
+                            modifiers.push_str(name);
+                        }
+                    }
+                    (modifiers, self.shortcut_key.clone(), self.shortcut.clone())
+                });
+                self.saving = true;
+                self.settings_error = None;
+                return iced::Task::perform(
+                    save_settings(original.clone(), self.preferences.clone(), binding),
+                    move |(result, label)| action::app(Message::Saved(id, result, label)),
+                );
+            }
+            Message::Saved(id, result, label) => {
+                self.saving = false;
+                if self.popup == Some(id) {
+                    if let Some(label) = label {
+                        self.shortcut = label;
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.original_preferences = Some(self.preferences.clone());
+                            self.error = None;
+                            return self.close_popup();
+                        }
+                        Err(error) => self.settings_error = Some(error),
+                    }
+                } else if let Err(error) = result {
+                    // Dismissing an in-flight Save must not silently hide its failure.
+                    self.error = Some(error);
+                }
+            }
+            Message::Cancel if !self.saving => return self.close_popup(),
             Message::Toggle
             | Message::ClosePopup(_)
-            | Message::SaveShortcut
+            | Message::Height(_)
+            | Message::Width(_)
+            | Message::AlwaysOnTop(_)
+            | Message::Save
+            | Message::Cancel
+            | Message::ShortcutLoaded(..)
             | Message::ShortcutModifier(..)
             | Message::ShortcutKey(_) => {}
         }
@@ -476,13 +572,21 @@ impl cosmic::Application for Applet {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        struct PreferencesSubscription;
-        cosmic_config::config_subscription::<_, Preferences>(
-            TypeId::of::<PreferencesSubscription>(),
-            settings::CONFIG_ID.into(),
-            settings::CONFIG_VERSION,
-        )
-        .map(|update| Message::Preferences(update.config))
+        if self.popup.is_none() {
+            return Subscription::none();
+        }
+        // Focused controls can capture Escape before libcosmic's navigation handler sees it.
+        iced::event::listen_raw(|event, _, id| {
+            if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) = event
+            {
+                Some(Message::ClosePopup(id))
+            } else {
+                None
+            }
+        })
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
@@ -492,4 +596,109 @@ impl cosmic::Application for Applet {
 
 fn main() -> cosmic::iced::Result {
     cosmic::applet::run::<Applet>(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::Application;
+
+    fn applet() -> Applet {
+        let preferences = Preferences::default();
+        Applet {
+            core: Core::default(),
+            busy: false,
+            error: None,
+            popup: Some(window::Id::unique()),
+            page: Page::Settings,
+            original_preferences: Some(preferences.clone()),
+            preferences,
+            settings_error: None,
+            shortcut_error: None,
+            shortcut: "Super+F12".into(),
+            shortcut_busy: false,
+            shortcut_edited: false,
+            shortcut_modifiers: Modifiers::LOGO,
+            shortcut_key: "F12".into(),
+            saving: false,
+        }
+    }
+
+    #[test]
+    fn cancel_discards_all_preference_edits() {
+        let mut applet = applet();
+        let original = applet.preferences.clone();
+        let _ = applet.update(Message::Height(70));
+        let _ = applet.update(Message::Width(60));
+        let _ = applet.update(Message::AlwaysOnTop(false));
+        assert_eq!(applet.original_preferences.as_ref(), Some(&original));
+        let _ = applet.update(Message::Cancel);
+        assert_eq!(applet.preferences, original);
+        assert!(applet.popup.is_none());
+    }
+
+    #[test]
+    fn escape_and_outside_dismiss_discard_draft() {
+        for escape in [false, true] {
+            let mut applet = applet();
+            let original = applet.preferences.clone();
+            let _ = applet.update(Message::Height(70));
+            let _ = applet.update(Message::ShortcutKey("F10".into()));
+            if escape {
+                let _ = applet.on_escape();
+            } else {
+                let id = applet.popup.unwrap();
+                let _ = applet.update(Message::ClosePopup(id));
+            }
+            assert_eq!(applet.preferences, original);
+            assert!(!applet.shortcut_edited);
+            assert!(applet.popup.is_none());
+        }
+    }
+
+    #[test]
+    fn late_shortcut_reads_preserve_edits_and_ignore_closed_sessions() {
+        let mut applet = applet();
+        let id = applet.popup.unwrap();
+        let _ = applet.update(Message::ShortcutKey("F10".into()));
+        let _ = applet.update(Message::ShortcutLoaded(id, Ok("Ctrl+F11".into())));
+        assert_eq!(applet.shortcut_key, "F10");
+        assert_eq!(applet.shortcut, "Ctrl+F11");
+        applet.popup = Some(window::Id::unique());
+        let _ = applet.update(Message::ShortcutLoaded(id, Ok("Alt+F9".into())));
+        assert_eq!(applet.shortcut, "Ctrl+F11");
+    }
+
+    #[test]
+    fn failed_save_keeps_draft_open_and_reports_partial_failure() {
+        let mut applet = applet();
+        let id = applet.popup.unwrap();
+        let _ = applet.update(Message::Height(70));
+        applet.saving = true;
+        let error = "Preferences saved, but the shortcut was not saved: conflict";
+        let _ = applet.update(Message::Saved(id, Err(error.into()), None));
+        assert_eq!(applet.popup, Some(id));
+        assert_eq!(applet.preferences.dropdown_height_percent, 70);
+        assert_eq!(applet.settings_error.as_deref(), Some(error));
+        assert!(!applet.saving);
+    }
+
+    #[test]
+    fn successful_save_accepts_draft_and_closes_dialog() {
+        let mut applet = applet();
+        let id = applet.popup.unwrap();
+        let _ = applet.update(Message::Height(70));
+        let _ = applet.update(Message::Saved(id, Ok(()), None));
+        assert_eq!(applet.preferences.dropdown_height_percent, 70);
+        assert!(applet.popup.is_none());
+    }
+
+    #[test]
+    fn cancel_cannot_undo_explicit_save_in_flight() {
+        let mut applet = applet();
+        applet.saving = true;
+        let id = applet.popup;
+        let _ = applet.update(Message::Cancel);
+        assert_eq!(applet.popup, id);
+    }
 }
