@@ -98,13 +98,13 @@ Right-click the panel icon. Select **Settings**.
 
 Height and width accept 1% to 100%. Select **Save** to apply edited settings to the open terminal. Select **Cancel**, press Escape or close the popup to discard unsaved edits. If Save reports an error, read the message: some fields may already be saved.
 
-The terminal has a minimum size of 96 × 96 logical pixels so the resize handle remains available. The screen and reserved panel space limit its size. The bottom bar shows the actual height percentage.
-
-Drag the colored bar at the bottom of the terminal to change its height. The bar has a grip mark and a live percentage. Release the mouse button to save the height.
+Use **Settings** to change the height and width. Mouse resizing is not supported. There is no resize handle or bottom size bar. The terminal has a minimum size of 96 × 96 logical pixels. The screen and reserved panel space limit its size.
 
 To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Save**. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
 
-Turn **Always on top** off to use a normal window. COSMIC then controls its position, size, tiling and stacking. It cannot be fixed to the top edge in this mode. Switching this setting keeps the same shells and tabs.
+The terminal always opens at the top edge, above application windows and below reserved panel space. Turn **Always on top** off to let application windows cover it when it loses focus. Showing the dropdown raises it again. This changes its stacking layer, not its position or size. It does not become a normal window. Changing this setting keeps the same shells and tabs.
+
+The terminal's close button hides the dropdown. It does not stop the backend or close its shells. Click the panel icon or use the shortcut to show the same session again. Use **Restart** or **Quit** in the panel menu only when you want to close all sessions.
 
 ### Restart or quit
 
@@ -117,9 +117,9 @@ Right-click the panel icon. The menu has **Settings**, **Restart** and **Quit**.
 
 ### Copy and paste
 
-Select terminal text. Use **Copy** in the right-click menu or press **Ctrl+Shift+C**. Paste into another application with that application's paste command. The backend keeps copied text available when you hide the dropdown or change its window mode. Another application can replace the clipboard contents normally.
+Select terminal text. Use **Copy** in the right-click menu or press **Ctrl+Shift+C**. Paste into another application with that application's paste command. The backend keeps copied text available when you hide the dropdown or change **Always on top**. Another application can replace the clipboard contents normally.
 
-Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, the bottom bar shows **Copy failed**. The backend log contains the error.
+Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, a **Copy failed** message appears below the terminal content. The backend log contains the error.
 
 ### Backend controls
 
@@ -137,7 +137,7 @@ Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from 
 
 The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
 
-Checks in an isolated COSMIC session covered Save, Cancel, shortcut conflicts, minimum and maximum sizes, live dragging, keyboard focus, both stacking modes and output resizing. Copying from the context menu remained available after hiding the terminal and pasted into another application. Shell identity stayed unchanged across surface changes. A forced compositor crash stopped the backend without continued log growth. Menu checks confirmed that Cancel kept the same backend, Restart replaced it, and Quit stopped it. The panel icon then started a new terminal. These checks do not cover every GPU or suspend path.
+Checks in an isolated COSMIC session covered Save, Cancel, shortcut conflicts, minimum and maximum sizes, keyboard focus, stacking and output resizing. The dropdown opened above a maximized application with **Always on top** off and on. With the setting off, focus transfer let the other application cover it; showing the dropdown raised it again. With the setting on, it stayed above the other application while that application received keyboard input. The close button hid it without changing the shell process or its variables. Settings changed its height and width; dragging its bottom edge did not. Copying from the context menu remained available after hiding the terminal and pasted into another application. A forced compositor crash stopped the backend without continued log growth. Menu checks confirmed that Cancel kept the same backend, Restart replaced it, and Quit stopped it. The panel icon then started a new terminal. These checks do not cover every GPU or suspend path.
 
 ## Migration and removal
 

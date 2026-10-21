@@ -339,7 +339,7 @@ impl Applet {
             .spacing(12)
             .into(),
             widget::text(
-                "Off uses a normal window. COSMIC controls its size, position and stacking.",
+                "Off lets other windows cover the dropdown when it loses focus. Opening it raises it.",
             )
             .size(12)
             .into(),
@@ -348,9 +348,6 @@ impl Applet {
             )
             .size(12)
             .into(),
-            widget::text("Release the terminal's bottom resize handle to save its height.")
-                .size(12)
-                .into(),
         ])
         .spacing(12)
         .width(Length::Fill);

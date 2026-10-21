@@ -83,7 +83,6 @@ mod dnd;
 use clap_lex::RawArgs;
 mod control;
 mod dropdown;
-mod resize_grip;
 
 static ICON_CACHE: LazyLock<Mutex<IconCache>> = LazyLock::new(|| Mutex::new(IconCache::new()));
 
@@ -385,14 +384,10 @@ impl MenuAction for Action {
 pub enum Message {
     Control(control::Request),
     Wayland(iced::core::event::wayland::Event),
-    SurfaceOpened(window::Id),
+    SurfaceOpened(window::Id, iced::Size),
     SurfaceClosed(window::Id),
     SurfaceCloseRequested(window::Id),
     SurfaceResized(window::Id, iced::Size),
-    DropdownResizeStart(window::Id, f32),
-    DropdownResizeMotion(window::Id, f32),
-    DropdownResizeEnd(window::Id),
-    WindowResizing(window::Id, bool),
     AppTheme(AppTheme),
     QuitAcknowledged,
     ReloadConfig,
@@ -522,7 +517,6 @@ pub struct App {
     core: Core,
     dropdown: dropdown::Dropdown,
     clipboard_failed: bool,
-    window_resize_active: bool,
     server: std::sync::Arc<control::Server>,
     about: About,
     pane_model: TerminalPaneGrid,
@@ -600,11 +594,15 @@ impl App {
             KeyboardInteractivity, set_keyboard_interactivity,
         };
         self.dropdown.visible = visible;
+        let stacking = if visible {
+            self.set_dropdown_raised(true)
+        } else {
+            Task::none()
+        };
         if !visible {
             self.pane_model.unfocus_all_terminals();
         }
         let keyboard = if self.dropdown.creating()
-            && self.dropdown.role() == dropdown::SurfaceRole::Overlay
             && let Some(id) = self.dropdown.surface
         {
             set_keyboard_interactivity(
@@ -618,7 +616,22 @@ impl App {
         } else {
             Task::none()
         };
-        keyboard.chain(self.reconcile_dropdown())
+        stacking.chain(keyboard).chain(self.reconcile_dropdown())
+    }
+
+    fn set_dropdown_raised(&mut self, raised: bool) -> Task<Message> {
+        if self.dropdown.set_raised(raised)
+            && self.dropdown.ready()
+            && self.dropdown.visible
+            && let Some(id) = self.dropdown.surface
+        {
+            iced::platform_specific::shell::commands::layer_surface::set_layer(
+                id,
+                self.dropdown.layer(),
+            )
+        } else {
+            Task::none()
+        }
     }
 
     fn resize_dropdown_surface(&self) -> Task<Message> {
@@ -631,25 +644,15 @@ impl App {
         let Some((width, height)) = self.dropdown.dimensions() else {
             return Task::none();
         };
-        match self.dropdown.role() {
-            dropdown::SurfaceRole::Overlay => {
-                use iced::platform_specific::shell::commands::layer_surface::{
-                    set_margin, set_size,
-                };
-                set_margin(id, 0, 0, self.dropdown.bottom_margin(height), 0).chain(set_size(
-                    id,
-                    Some(width),
-                    None,
-                ))
-            }
-            dropdown::SurfaceRole::Window => {
-                window::resize(id, iced::Size::new(width as f32, height as f32))
-            }
-        }
+        use iced::platform_specific::shell::commands::layer_surface::{
+            set_layer, set_margin, set_size,
+        };
+        set_layer(id, self.dropdown.layer())
+            .chain(set_margin(id, 0, 0, self.dropdown.bottom_margin(height), 0))
+            .chain(set_size(id, Some(width), None))
     }
 
     fn reconcile_dropdown(&mut self) -> Task<Message> {
-        use dropdown::{SurfaceRole, SurfaceSettings};
         use iced::platform_specific::shell::commands::layer_surface::{
             KeyboardInteractivity, destroy_layer_surface, get_layer_surface,
             set_keyboard_interactivity,
@@ -657,31 +660,15 @@ impl App {
         if let Some(id) = self.dropdown.begin_close() {
             self.pane_model.unfocus_all_terminals();
             self.core.set_main_window_id(None);
-            return match self.dropdown.role() {
-                SurfaceRole::Overlay => set_keyboard_interactivity(id, KeyboardInteractivity::None)
-                    .chain(destroy_layer_surface(id)),
-                SurfaceRole::Window => window::close(id),
-            };
+            return set_keyboard_interactivity(id, KeyboardInteractivity::None)
+                .chain(destroy_layer_surface(id));
         }
         let Some(settings) = self.dropdown.settings() else {
             return Task::none();
         };
-        let (id, role, surface) = match settings {
-            SurfaceSettings::Overlay(settings) => (
-                settings.id,
-                SurfaceRole::Overlay,
-                get_layer_surface(settings),
-            ),
-            SurfaceSettings::Window(settings) => {
-                let (id, task) = window::open(settings);
-                (
-                    id,
-                    SurfaceRole::Window,
-                    task.map(|id| action::app(Message::SurfaceOpened(id))),
-                )
-            }
-        };
-        self.dropdown.begin_create(id, role);
+        let id = settings.id;
+        let surface = get_layer_surface(settings);
+        self.dropdown.begin_create(id);
         self.core.set_main_window_id(Some(id));
         let empty = self
             .pane_model
@@ -737,10 +724,14 @@ impl App {
             }
             Wayland::Layer(LayerEvent::Done, _, id) => return self.surface_closed(id),
             Wayland::Layer(LayerEvent::Focused, _, id) if self.dropdown.surface == Some(id) => {
-                return self.update(Message::WindowFocused);
+                return self
+                    .set_dropdown_raised(true)
+                    .chain(self.update(Message::WindowFocused));
             }
             Wayland::Layer(LayerEvent::Unfocused, _, id) if self.dropdown.surface == Some(id) => {
-                return self.update(Message::WindowUnfocused);
+                return self
+                    .set_dropdown_raised(false)
+                    .chain(self.update(Message::WindowUnfocused));
             }
             _ => (),
         }
@@ -2090,7 +2081,6 @@ impl Application for App {
             core,
             dropdown: dropdown::Dropdown::default(),
             clipboard_failed: false,
-            window_resize_active: false,
             server: flags.server,
             about,
             pane_model,
@@ -2260,7 +2250,10 @@ impl Application for App {
                 return task;
             }
             Message::Wayland(event) => return self.wayland_event(event),
-            Message::SurfaceOpened(id) => return self.surface_opened(id),
+            Message::SurfaceOpened(id, size) => {
+                self.dropdown.resized(id, size);
+                return self.surface_opened(id);
+            }
             Message::SurfaceClosed(id) => return self.surface_closed(id),
             Message::SurfaceCloseRequested(id) => {
                 if self.dropdown.surface == Some(id) {
@@ -2270,39 +2263,6 @@ impl Application for App {
             Message::SurfaceResized(id, size) => {
                 if self.dropdown.resized(id, size) {
                     return self.resize_dropdown_surface();
-                }
-            }
-            Message::DropdownResizeStart(id, y) => {
-                self.dropdown.start_resize(id, y);
-                if self.dropdown.role() == dropdown::SurfaceRole::Window && self.dropdown.resizing()
-                {
-                    self.window_resize_active = false;
-                    return window::drag_resize(id, window::Direction::South);
-                }
-            }
-            Message::DropdownResizeMotion(id, y) => {
-                if self.dropdown.drag_resize(id, y) {
-                    return self.resize_dropdown_surface();
-                }
-            }
-            Message::DropdownResizeEnd(id) => {
-                if self.dropdown.resizing() {
-                    if let Some(percent) = self.dropdown.finish_resize(id) {
-                        config_set!(dropdown_height_percent, percent);
-                    }
-                } else {
-                    return self.update(Message::CopyPrimary(None));
-                }
-            }
-            Message::WindowResizing(id, resizing) => {
-                if self.dropdown.surface == Some(id)
-                    && self.dropdown.role() == dropdown::SurfaceRole::Window
-                {
-                    let ended = self.window_resize_active && !resizing;
-                    self.window_resize_active = resizing;
-                    if ended && self.dropdown.resizing() {
-                        return self.update(Message::DropdownResizeEnd(id));
-                    }
                 }
             }
             Message::AppTheme(app_theme) => {
@@ -3867,48 +3827,18 @@ impl Application for App {
         } else {
             pane_grid.into()
         };
-        let percent = self.dropdown.displayed_height_percent();
-        let resizing = self.dropdown.resizing();
-        let clipboard_failed = self.clipboard_failed;
-        let grip = widget::responsive(move |size| {
-            let label = if clipboard_failed {
-                "Copy failed — see backend log".into()
-            } else if size.width >= 320.0 {
-                format!("Height: {percent}% — drag to resize")
-            } else {
-                format!("{percent}%")
-            };
-            widget::container(widget::text(label).size(12))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .class(style::Container::custom(move |theme| {
-                    let cosmic = theme.cosmic();
-                    cosmic::iced::widget::container::Style {
-                        background: Some(iced::Background::Color(
-                            if resizing {
-                                cosmic.accent.hover_state_color()
-                            } else {
-                                cosmic.accent.base
-                            }
-                            .into(),
-                        )),
-                        text_color: Some(cosmic.accent.on.into()),
-                        ..Default::default()
-                    }
-                }))
-                .into()
-        })
-        .height(Length::Fixed(resize_grip::HEIGHT));
-        let content = widget::column::with_children(vec![panes, grip.into()])
+        if self.clipboard_failed {
+            widget::column::with_children(vec![
+                panes,
+                widget::text("Copy failed — see backend log")
+                    .size(12)
+                    .into(),
+            ])
             .width(Length::Fill)
             .height(Length::Fill)
-            .into();
-        if let Some(id) = self.dropdown.surface {
-            resize_grip::resize_grip(content, id, self.dropdown.resizing())
+            .into()
         } else {
-            content
+            panes
         }
     }
 
@@ -3927,19 +3857,14 @@ impl Application for App {
         Subscription::batch([
             self.server.subscription(),
             event::listen_with(|event, _status, _window_id| match event {
-                Event::PlatformSpecific(iced::core::event::PlatformSpecific::Wayland(
-                    iced::core::event::wayland::Event::Window(
-                        iced::core::event::wayland::WindowEvent::WindowState(state),
-                    ),
-                )) => Some(Message::WindowResizing(
-                    _window_id,
-                    state.contains(cosmic::cctk::sctk::reexports::csd_frame::WindowState::RESIZING),
-                )),
                 Event::PlatformSpecific(iced::core::event::PlatformSpecific::Wayland(event)) => {
                     Some(Message::Wayland(event))
                 }
-                Event::Window(window::Event::Opened { .. }) => {
-                    Some(Message::SurfaceOpened(_window_id))
+                Event::Window(window::Event::Opened { size, .. }) => {
+                    Some(Message::SurfaceOpened(_window_id, size))
+                }
+                Event::Window(window::Event::Resized(size)) => {
+                    Some(Message::SurfaceResized(_window_id, size))
                 }
                 Event::Window(window::Event::Closed) => Some(Message::SurfaceClosed(_window_id)),
                 Event::Window(window::Event::CloseRequested) => {
@@ -3955,7 +3880,7 @@ impl Application for App {
                     Some(Message::Modifiers(modifiers))
                 }
                 Event::Mouse(MouseEvent::ButtonReleased(MouseButton::Left)) => {
-                    Some(Message::DropdownResizeEnd(_window_id))
+                    Some(Message::CopyPrimary(None))
                 }
                 _ => None,
             }),
