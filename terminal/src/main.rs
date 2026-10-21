@@ -233,10 +233,11 @@ fn print_help() {
         r#"Cosmos Dropdown Terminal
 Native Wayland dropdown terminal; configurable screen percentages, no animation.
 
-Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|reload|quit|start]
+Usage: cosmos-applet-dropdown-terminal-backend [toggle|toggle-visibility|show|hide|status|reload|quit|start]
        cosmos-applet-dropdown-terminal-backend --daemon [-w DIR] [-e PROGRAM [ARGS...]]
 
-  toggle (default)   Toggle visibility; start a backend if needed
+  toggle (default)   Toggle, or restore a covered dropdown; start a backend if needed
+  toggle-visibility  Toggle mapped visibility regardless of focus (panel icon)
   show               Show; start a backend if needed
   hide               Hide without terminating shells
   status             Print visible, hidden, or stopped
@@ -250,7 +251,7 @@ Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|reload|q
   -V, --version      Show version
 
 Socket: $XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/control.sock
-Commands: toggle/show/hide/status/reload/quit followed by newline.
+Commands: toggle/toggle-visibility/show/hide/status/reload/quit followed by newline.
 Replies: visible/hidden/reloaded/bye, or error MESSAGE followed by newline.
 First advertised usable output is selected; output changes resize the surface."#
     );
@@ -647,9 +648,16 @@ impl App {
         use iced::platform_specific::shell::commands::layer_surface::{
             set_layer, set_margin, set_size,
         };
+        // libcosmic currently synthesizes a square configure from set_size's width.
+        // Do not request an unchanged width when only the bottom margin needs updating.
+        let width_update = if self.dropdown.needs_width_update(width) {
+            set_size(id, Some(width), None)
+        } else {
+            Task::none()
+        };
         set_layer(id, self.dropdown.layer())
             .chain(set_margin(id, 0, 0, self.dropdown.bottom_margin(height), 0))
-            .chain(set_size(id, Some(width), None))
+            .chain(width_update)
     }
 
     fn reconcile_dropdown(&mut self) -> Task<Message> {
@@ -688,9 +696,13 @@ impl App {
         }
         let transition = self.reconcile_dropdown();
         if self.dropdown.ready() && self.dropdown.visible {
-            transition
-                .chain(self.resize_dropdown_surface())
-                .chain(self.update_focus())
+            transition.chain(self.resize_dropdown_surface()).chain(
+                if self.dropdown.content_size().is_some() {
+                    self.update_focus()
+                } else {
+                    Task::none()
+                },
+            )
         } else {
             transition
         }
@@ -2228,6 +2240,7 @@ impl Application for App {
                         let visible = self.dropdown.prepare_toggle();
                         self.set_dropdown_visible(visible)
                     }
+                    Command::ToggleVisibility => self.set_dropdown_visible(!self.dropdown.visible),
                     Command::Show => self.set_dropdown_visible(true),
                     Command::Hide => self.set_dropdown_visible(false),
                     Command::Status => Task::none(),
@@ -2267,9 +2280,18 @@ impl Application for App {
                 }
             }
             Message::SurfaceResized(id, size) => {
-                if self.dropdown.resized(id, size) {
-                    return self.resize_dropdown_surface();
-                }
+                let had_content = self.dropdown.content_size().is_some();
+                let task = if self.dropdown.resized(id, size) {
+                    self.resize_dropdown_surface()
+                } else {
+                    Task::none()
+                };
+                // The geometry gate removes widget state; focus its replacement once ready.
+                return if !had_content && self.dropdown.content_size().is_some() {
+                    task.chain(self.update_focus())
+                } else {
+                    task
+                };
             }
             Message::AppTheme(app_theme) => {
                 config_set!(app_theme, app_theme);
@@ -3641,6 +3663,13 @@ impl Application for App {
 
     /// Creates a view after each update.
     fn view(&self) -> Element<'_, Self::Message> {
+        // Measurement and intermediate configures must not resize persistent PTYs.
+        let Some(surface_size) = self.dropdown.content_size() else {
+            return widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        };
         let t = self.core().system_theme();
         let cosmic = t.cosmic();
         let cosmic_theme::Spacing {
@@ -3700,6 +3729,7 @@ impl Application for App {
             if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
                 let mut terminal_box = terminal_box(terminal, &self.key_binds)
                     .id(terminal_id)
+                    .surface_size(surface_size)
                     .disabled(self.core.window.show_context)
                     .on_context_menu(move |menu_state| Message::TabContextMenu(pane, menu_state))
                     .on_middle_click(move || Message::MiddleClick(pane, Some(entity_middle_click)))

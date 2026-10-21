@@ -124,6 +124,7 @@ pub struct TerminalBox<'a, Message> {
     key_binds: &'a HashMap<KeyBind, Action>,
     sharp_corners: bool,
     disabled: bool,
+    surface_size: Option<Size>,
 }
 
 impl<'a, Message> TerminalBox<'a, Message>
@@ -151,7 +152,13 @@ where
             on_window_unfocused: None,
             sharp_corners: false,
             disabled: false,
+            surface_size: None,
         }
+    }
+
+    pub fn surface_size(mut self, size: Size) -> Self {
+        self.surface_size = Some(size);
+        self
     }
 
     pub fn id(mut self, id: Id) -> Self {
@@ -412,6 +419,15 @@ where
         cursor_position: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        // Native configure can relayout the old widget before its resize message
+        // rebuilds the view. Never resize the PTY from those unconfirmed bounds.
+        if self
+            .surface_size
+            .is_some_and(|size| size != viewport.size())
+        {
+            return;
+        }
+
         let instant = Instant::now();
 
         let state = tree.state.downcast_ref::<State>();

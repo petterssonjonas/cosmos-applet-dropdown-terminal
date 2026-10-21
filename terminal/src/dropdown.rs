@@ -40,6 +40,8 @@ pub struct Dropdown {
     // Show raises even an unpinned dropdown; losing focus lets other windows cover it.
     raised: bool,
     available_height: Option<u32>,
+    configured_size: Option<Size>,
+    measurement_margin: Option<u32>,
 }
 
 impl Default for Dropdown {
@@ -56,6 +58,8 @@ impl Default for Dropdown {
             always_on_top: true,
             raised: true,
             available_height: None,
+            configured_size: None,
+            measurement_margin: None,
         }
     }
 }
@@ -110,6 +114,7 @@ impl Dropdown {
     pub fn begin_create(&mut self, id: window::Id) {
         self.surface = Some(id);
         self.phase = Phase::Creating;
+        self.configured_size = None;
     }
 
     pub fn opened(&mut self, id: window::Id) -> bool {
@@ -122,6 +127,20 @@ impl Dropdown {
 
     pub fn ready(&self) -> bool {
         self.phase == Phase::Ready
+    }
+
+    /// Only expose terminal content after this surface reaches its requested geometry.
+    pub fn content_size(&self) -> Option<Size> {
+        if !self.ready() || !self.visible || self.surface_invalidated {
+            return None;
+        }
+        let size = self.configured_size?;
+        matches_dimensions(size, self.dimensions()?).then_some(size)
+    }
+
+    pub fn needs_width_update(&self, width: u32) -> bool {
+        self.configured_size
+            .is_none_or(|size| size.width as u32 != width)
     }
 
     pub fn creating(&self) -> bool {
@@ -138,6 +157,8 @@ impl Dropdown {
         self.surface = None;
         self.phase = Phase::Absent;
         self.surface_invalidated = false;
+        self.configured_size = None;
+        self.measurement_margin = None;
         true
     }
 
@@ -215,6 +236,8 @@ impl Dropdown {
         }
         self.select_output();
         let (width, height) = self.dimensions()?;
+        let bottom_margin = self.bottom_margin(height);
+        self.measurement_margin = Some(bottom_margin as u32);
         Some(SctkLayerSurfaceSettings {
             id: window::Id::unique(),
             // Stacking does not change the dropdown into a managed window.
@@ -226,11 +249,11 @@ impl Dropdown {
             namespace: "cosmos-applet-dropdown-terminal-backend".into(),
             // Respect reserved panel space so the applet remains clickable.
             exclusive_zone: 0,
-            // Measure usable height once, then reserve the unused space below.
-            // Opposing anchors keep the terminal on-screen even at 100%.
+            // The initial configure measures usable height without resizing any PTY.
+            // Reuse its margin on remap, then check for changed panel reservations.
             size: Some((Some(width), None)),
             margin: IcedMargin {
-                bottom: self.bottom_margin(height),
+                bottom: bottom_margin,
                 ..Default::default()
             },
             size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
@@ -239,15 +262,32 @@ impl Dropdown {
     }
 
     pub fn resized(&mut self, id: window::Id, size: Size) -> bool {
-        if self.surface != Some(id) {
+        if self.surface != Some(id)
+            || !size.width.is_finite()
+            || !size.height.is_finite()
+            || size.width < 1.0
+            || size.height < 1.0
+        {
             return false;
         }
-        if self.available_height.is_none() {
-            self.available_height = Some(size.height.max(1.0).round() as u32);
-            return true;
+        self.configured_size = Some(size);
+        let margin = self
+            .measurement_margin
+            .take()
+            .or_else(|| self.available_height.is_none().then_some(0));
+        if let Some(margin) = margin {
+            let available_height = Some((size.height as u32).saturating_add(margin));
+            let changed = self.available_height != available_height;
+            self.available_height = available_height;
+            return changed;
         }
         false
     }
+}
+
+fn matches_dimensions(size: Size, (width, height): (u32, u32)) -> bool {
+    // Fractional scaling rounds physical buffers up before reporting logical size.
+    size.width as u32 == width && size.height as u32 == height
 }
 
 fn percent_size(size: u32, percent: u8) -> u32 {
@@ -294,6 +334,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn measurement_and_stale_bounds_do_not_match_requested_content_geometry() {
+        assert_eq!(
+            [
+                Size::new(1280.0, 768.0),
+                Size::new(1280.0, 1280.0),
+                Size::new(640.0, 320.0),
+                Size::new(1280.0, 320.0),
+            ]
+            .map(|size| matches_dimensions(size, (1280, 320))),
+            [false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn fractional_scale_rounding_accepts_only_the_requested_logical_dimensions() {
+        assert_eq!(
+            [
+                Size::new(1280.8, 320.8),
+                Size::new(1281.0, 320.0),
+                Size::new(1280.0, 319.8),
+            ]
+            .map(|size| matches_dimensions(size, (1280, 320))),
+            [true, false, false]
+        );
+    }
+
+    #[test]
     fn percentages_round_and_clamp_without_zero_sized_surfaces() {
         assert_eq!(
             [1, 1081, 2160].map(|size| percent_size(size, 33)),
@@ -331,9 +398,31 @@ mod tests {
         dropdown.visible = true;
         let next = window::Id::unique();
         dropdown.begin_create(next);
+        assert_eq!(dropdown.configured_size, None);
+        assert!(dropdown.needs_width_update(1280));
         assert!(!dropdown.resized(id, Size::new(1.0, 1.0)));
+        assert_eq!(dropdown.configured_size, None);
         assert!(!dropdown.resized(next, Size::new(1280.0, 320.0)));
+        assert_eq!(dropdown.configured_size, Some(Size::new(1280.0, 320.0)));
+        assert!(!dropdown.needs_width_update(1280));
+        assert!(dropdown.needs_width_update(640));
         assert_eq!(dropdown.bottom_margin(320), 448);
+    }
+
+    #[test]
+    fn remap_rechecks_panel_space_without_measuring_terminal_height_as_usable_height() {
+        let id = window::Id::unique();
+        let mut dropdown = Dropdown {
+            visible: true,
+            available_height: Some(768),
+            measurement_margin: Some(448),
+            ..Default::default()
+        };
+        dropdown.begin_create(id);
+        assert!(dropdown.resized(id, Size::new(1280.0, 300.0)));
+        assert_eq!(dropdown.available_height, Some(748));
+        assert!(!dropdown.resized(id, Size::new(1280.0, 320.0)));
+        assert_eq!(dropdown.available_height, Some(748));
     }
 
     #[test]

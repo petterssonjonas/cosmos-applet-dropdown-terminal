@@ -83,6 +83,7 @@ fn wait_for_display_disconnect(socket: UnixStream) -> io::Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Toggle,
+    ToggleVisibility,
     Show,
     Hide,
     Status,
@@ -93,6 +94,7 @@ impl Command {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "toggle" => Self::Toggle,
+            "toggle-visibility" => Self::ToggleVisibility,
             "show" => Self::Show,
             "hide" => Self::Hide,
             "status" => Self::Status,
@@ -104,6 +106,7 @@ impl Command {
     pub fn name(self) -> &'static str {
         match self {
             Self::Toggle => "toggle",
+            Self::ToggleVisibility => "toggle-visibility",
             Self::Show => "show",
             Self::Hide => "hide",
             Self::Status => "status",
@@ -486,7 +489,15 @@ mod tests {
     }
     #[test]
     fn accepts_only_documented_commands() {
-        for name in ["toggle", "show", "hide", "status", "reload", "quit"] {
+        for name in [
+            "toggle",
+            "toggle-visibility",
+            "show",
+            "hide",
+            "status",
+            "reload",
+            "quit",
+        ] {
             assert_eq!(Command::parse(name).unwrap().name(), name);
         }
         assert_eq!(Command::parse("toggle show"), None);

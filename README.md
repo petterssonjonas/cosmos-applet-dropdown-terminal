@@ -102,20 +102,19 @@ Use **Settings** to change the height and width. Mouse resizing is not supported
 
 To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Save**. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
 
-The terminal always opens at the top edge, above application windows and below reserved panel space. Turn **Always on top** off to let application windows cover it when it loses focus. If another application covers it, one shortcut press or panel click raises the dropdown and restores keyboard focus. The next activation hides it. This changes its stacking layer, not its position or size. It does not become a normal window. Changing this setting keeps the same shells and tabs.
+The terminal always opens at the top edge, above application windows and below reserved panel space. Turn **Always on top** off to let application windows cover it when it loses focus. If another application covers it, one shortcut press raises the dropdown and restores keyboard focus. The next shortcut press hides it. The panel icon works differently: a full left-click hides a visible dropdown or shows a hidden dropdown, even if another application covers it. The action runs when you release the mouse button. Changing the stacking layer does not change the position or size, create a normal window or close shells and tabs.
 
 You can type when the dropdown appears. You do not need to click inside it first.
 
-The terminal's close button hides the dropdown. It does not stop the backend or close its shells. Click the panel icon or use the shortcut to show the same session again. Use **Restart** or **Quit** in the panel menu only when you want to close all sessions.
+The terminal's close button hides the dropdown. It does not stop the backend or close its shells. Click the panel icon or use the shortcut to show the same session again. Use **Restart** in the panel menu only when you want to close all sessions.
 
-### Restart or quit
+### Restart
 
-Right-click the panel icon. The menu has **Settings**, **Restart** and **Quit**.
+Right-click the panel icon. The menu has **Settings** and **Restart**.
 
-- **Restart** stops the terminal backend, then opens a new terminal with the installed version.
-- **Quit** stops the terminal backend. The panel icon stays in place. Click the icon or use the shortcut to start a new terminal.
+**Restart** stops the terminal backend, then opens a new terminal with the installed version.
 
-**Warning:** Restart and Quit close all terminal shells and running jobs. Finish your work first. Both actions ask for confirmation. Select **Cancel** to keep the terminal running. To keep your shells and jobs, hide the dropdown instead.
+**Warning:** Restart closes all terminal shells and running jobs. Finish your work first. Restart asks for confirmation. Select **Cancel** to keep the terminal running. To keep your shells and jobs, hide the dropdown instead.
 
 ### Copy and paste
 
@@ -127,19 +126,22 @@ Use **Ctrl+Shift+V** to paste into the terminal. If copying fails, a **Copy fail
 
 ```sh
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend toggle
+~/.local/bin/cosmos-applet-dropdown-terminal-backend toggle-visibility
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend status
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend reload
 # WARNING: quit terminates shells and running jobs.
 ~/.local/bin/cosmos-applet-dropdown-terminal-backend quit
 ```
 
-Removing the applet or installing an upgrade does not stop the backend. An old backend can keep running with old resize or settings behavior. Finish its jobs, then select **Restart** from the panel icon menu. Remove and add the panel applet again to load a new applet version. If the installed applet has no Restart action, run `~/.local/bin/cosmos-applet-dropdown-terminal-backend quit` before adding it again. Restart and Quit close all terminal shells. Logout also ends sessions. Do not restart the backend just to change settings: **Save** reloads preferences without closing shells.
+Removing the applet or installing an upgrade does not stop the backend. Finish its jobs, then select **Restart** from the panel icon menu. Remove and add the panel applet again to load the new click behavior and menu. Both the applet and backend must use the new version. If the installed applet has no Restart action, run `~/.local/bin/cosmos-applet-dropdown-terminal-backend quit` before adding it again. Restart and the `quit` command close all terminal shells. Logout also ends sessions. Do not restart the backend just to change settings: **Save** reloads preferences without closing shells.
 
 Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
 
 The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
 
-Checks in an isolated COSMIC session covered Save, Cancel, shortcut conflicts, minimum and maximum sizes, keyboard focus, stacking and output resizing. The dropdown opened above a maximized application with **Always on top** off and on. With the setting off, focus transfer let the other application cover it; showing the dropdown raised it again. With the setting on, it stayed above the other application while that application received keyboard input. The close button hid it without changing the shell process or its variables. Settings changed its height and width; dragging its bottom edge did not. Copying from the context menu remained available after hiding the terminal and pasted into another application. A forced compositor crash stopped the backend without continued log growth. Menu checks confirmed that Cancel kept the same backend, Restart replaced it, and Quit stopped it. The panel icon then started a new terminal. These checks do not cover every GPU or suspend path.
+Checks in an isolated COSMIC session confirmed repeated left-click toggles, including separate mouse-down and release events, a covered dropdown and an open Settings popup. The backend process, shell process and shell variables stayed unchanged. Terminal rows and columns stayed unchanged across hide and show cycles. Before the fix, one cycle changed the row count from 12 to 60 and back to 12. The panel menu now contains only Settings and Restart. These checks do not cover every GPU or suspend path.
+
+Live checks also confirmed changes to height, width and Always on top, a configured Super+F12 shortcut, Restart confirmation and Cancel. Normal toggles kept the same backend. Restart replaced it and opened a new dropdown. Strict Clippy checks, all 64 tests and the release build passed.
 
 ## Migration and removal
 
