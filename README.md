@@ -92,7 +92,7 @@ Right-click the panel icon. Select **Settings**.
 
 | Setting | Default | Use |
 | --- | --- | --- |
-| Monitor | Automatic | Set an exact Wayland output name, such as `DP-1` or `HDMI-A-1`. Blank uses automatic selection. |
+| Monitor | Automatic | Choose a connected Wayland display from the dropdown. Display names include their connector, such as `DP-1`. |
 | Height | 40% | Set the height as a percentage of the screen. |
 | Width | 100% | Set the width as a percentage of the screen. A narrow dropdown is centered. |
 | Always on top | On | Keep the dropdown above other windows without blocking their keyboard input. |
@@ -102,9 +102,11 @@ Height and width accept 1% to 100%. Select **Save** to apply edited settings to 
 
 Use **Settings** to change the height and width. Mouse resizing is not supported. There is no resize handle or bottom size bar. The terminal has a minimum size of 96 × 96 logical pixels. The screen and reserved panel space limit its size.
 
-For a multi-monitor setup, enter the desired connector name in **Monitor**. Run `wayland-info` and look for the output's `name` (not its make/model description). Names are case-sensitive. Saving moves the dropdown without closing its shells or jobs. If that monitor is disconnected, the dropdown falls back to another usable output and returns when the selected monitor reconnects. Wayland does not expose a universal primary-monitor flag; automatic selection keeps the current usable output, initially the first one advertised by the compositor.
+For a multi-monitor setup, choose the desired display in **Monitor**. The list is read from the desktop Wayland connection and updates while settings is open when monitors connect or disconnect, even if the panel only appears on one monitor. **Automatic** keeps the current usable output, initially the first one advertised by the compositor; Wayland does not expose a universal primary-monitor flag. Saving moves the dropdown without closing its shells or jobs. If the selected monitor disconnects, its selection remains marked **disconnected**, the terminal falls back to another usable output, and it returns when that monitor reconnects. Existing saved connector names remain supported.
 
 To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12`, `Escape` or `grave`. XKB names are case-insensitive; `Esc` and `escape` both become `Escape`. For **Super+Escape**, select **Super**, type `Esc` in the key field, then select **Save**. Pressing Escape in the field releases its focus rather than recording the key or closing settings. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
+
+To reuse a built-in combination such as **Super+Escape**, remove its existing action in COSMIC Settings, then close COSMIC Settings before saving the applet shortcut. The applet respects COSMIC's disabled-default overrides; it does not treat a removed built-in as an active conflict. Active actions still prevent reassignment. Changing away from a reassigned built-in combination keeps that built-in disabled rather than unexpectedly restoring it.
 
 The terminal opens at the top edge, above application windows and below reserved panel space. **Always on top** controls stacking only. With it off, clicking another application lets that application cover the dropdown. With it on, the dropdown stays above that application, but the application can receive keyboard input.
 

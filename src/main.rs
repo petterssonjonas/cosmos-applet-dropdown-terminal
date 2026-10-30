@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+mod outputs;
 mod panel;
 mod settings;
 
@@ -52,6 +53,9 @@ struct Applet {
     shortcut_edited: bool,
     shortcut_modifiers: Modifiers,
     shortcut_key: String,
+    output_choices: std::sync::Arc<[outputs::Display]>,
+    outputs_loading: bool,
+    outputs_error: Option<String>,
     saving: bool,
     panel_guard: panel::Guard,
     panel_error: Option<String>,
@@ -78,6 +82,7 @@ enum Message {
     Height(u8),
     Width(u8),
     Output(String),
+    Outputs(window::Id, Result<Vec<outputs::Display>, String>),
     AlwaysOnTop(bool),
     CloseOnFocusLoss(bool),
     ShortcutModifier(Modifiers, bool),
@@ -258,6 +263,9 @@ impl Applet {
                     None
                 }
             };
+            self.output_choices = outputs::choices(Vec::new(), &self.preferences.dropdown_output);
+            self.outputs_loading = true;
+            self.outputs_error = None;
             self.shortcut = "Unassigned".into();
             self.shortcut_modifiers = Modifiers::LOGO;
             self.shortcut_key = "§".into();
@@ -400,6 +408,22 @@ impl Applet {
             Message::Output(value) if !self.saving => {
                 self.preferences.dropdown_output = value.trim().to_owned();
             }
+            Message::Outputs(id, result)
+                if self.popup == Some(id) && self.page == Page::Settings =>
+            {
+                self.outputs_loading = false;
+                match result {
+                    Ok(displays) => {
+                        self.output_choices =
+                            outputs::choices(displays, &self.preferences.dropdown_output);
+                        self.outputs_error = None;
+                    }
+                    Err(error) => {
+                        self.outputs_error =
+                            Some(format!("Cannot list connected displays: {error}"));
+                    }
+                }
+            }
             Message::AlwaysOnTop(value) if !self.saving => {
                 self.preferences.dropdown_always_on_top = value;
             }
@@ -480,6 +504,7 @@ impl Applet {
             | Message::Height(_)
             | Message::Width(_)
             | Message::Output(_)
+            | Message::Outputs(..)
             | Message::AlwaysOnTop(_)
             | Message::CloseOnFocusLoss(_)
             | Message::Save
@@ -529,10 +554,16 @@ impl Applet {
             shortcut_controls =
                 shortcut_controls.push(widget::text(format!("Error: {error}")).size(14));
         }
-        let mut output = widget::text_input("Automatic", &self.preferences.dropdown_output);
-        if !self.saving {
-            output = output.on_input(Message::Output);
-        }
+        let selected = self
+            .output_choices
+            .iter()
+            .position(|display| display.name == self.preferences.dropdown_output);
+        // Keep the event's option names stable if hotplug refreshes the list before selection.
+        let choices = self.output_choices.clone();
+        let output = widget::dropdown(self.output_choices.as_ref(), selected, move |index| {
+            Message::Output(choices[index].name.clone())
+        })
+        .width(Length::Fill);
         let content = widget::column([
             widget::text::title3("Dropdown settings").into(),
             shortcut_controls.into(),
@@ -540,8 +571,15 @@ impl Applet {
             widget::text("Monitor").into(),
             output.into(),
             widget::text(
-                "Enter a Wayland output name, e.g. DP-1 or HDMI-A-1 (listed by wayland-info). Leave blank for automatic selection. If disconnected, another monitor is used until it returns.",
+                "Select a connected display, or Automatic. A disconnected selection is kept and used again when it returns.",
             )
+            .size(12)
+            .into(),
+            widget::text(if self.outputs_loading {
+                "Reading connected displays…"
+            } else {
+                self.outputs_error.as_deref().unwrap_or("The display list updates when monitors connect or disconnect.")
+            })
             .size(12)
             .into(),
             widget::text(format!("Height: {height}% of screen")).into(),
@@ -660,6 +698,9 @@ impl cosmic::Application for Applet {
                 shortcut_edited: false,
                 shortcut_modifiers: Modifiers::LOGO,
                 shortcut_key: "§".into(),
+                output_choices: outputs::choices(Vec::new(), ""),
+                outputs_loading: false,
+                outputs_error: None,
                 saving: false,
                 panel_guard: panel::Guard::default(),
                 panel_error: None,
@@ -785,7 +826,17 @@ impl cosmic::Application for Applet {
             }
             _ => None,
         });
-        Subscription::batch([events, self.panel_guard.subscription().map(Message::Panel)])
+        let displays = match (self.popup, self.page) {
+            (Some(id), Page::Settings) => {
+                outputs::subscription(id).map(|(id, result)| Message::Outputs(id, result))
+            }
+            _ => Subscription::none(),
+        };
+        Subscription::batch([
+            events,
+            displays,
+            self.panel_guard.subscription().map(Message::Panel),
+        ])
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
@@ -822,6 +873,9 @@ mod tests {
             shortcut_edited: false,
             shortcut_modifiers: Modifiers::LOGO,
             shortcut_key: "F12".into(),
+            output_choices: outputs::choices(Vec::new(), ""),
+            outputs_loading: false,
+            outputs_error: None,
             saving: false,
             panel_guard,
             panel_error: None,
@@ -844,6 +898,28 @@ mod tests {
         let _ = applet.update(Message::Cancel);
         assert_eq!(applet.preferences, original);
         assert!(applet.popup.is_none());
+    }
+
+    #[test]
+    fn hotplug_preserves_monitor_draft_and_ignores_closed_dialog_updates() {
+        let mut applet = applet();
+        let id = applet.popup.unwrap();
+        let _ = applet.update(Message::Output("DP-1".into()));
+        let _ = applet.update(Message::Outputs(id, Ok(Vec::new())));
+        assert_eq!(applet.preferences.dropdown_output, "DP-1");
+        assert_eq!(applet.output_choices[1].label, "DP-1 (disconnected)");
+        let _ = applet.update(Message::Outputs(
+            id,
+            Ok(vec![outputs::Display {
+                name: "DP-1".into(),
+                label: "DP-1 — Display".into(),
+            }]),
+        ));
+        assert_eq!(applet.output_choices[1].label, "DP-1 — Display");
+        let _ = applet.update(Message::Cancel);
+        assert!(applet.preferences.dropdown_output.is_empty());
+        let _ = applet.update(Message::Outputs(id, Ok(Vec::new())));
+        assert_eq!(applet.output_choices[1].label, "DP-1 — Display");
     }
 
     #[test]

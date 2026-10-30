@@ -19,6 +19,7 @@ Positional COMMAND registers Super+section only when unassigned.
 MODIFIERS is a comma-separated list of Super,Ctrl,Alt,Shift; use '' for none.
 KEY is an XKB keysym name or one Unicode character (including §).
 Success prints the canonical chord; --get prints Unassigned when absent.
+Explicitly disabled bindings can be reused; custom bindings shadow defaults.
 Close COSMIC Settings before changing shortcuts. Uses XDG_CONFIG_HOME and keeps
 custom.before-dropdown. Conflicts, duplicates and physical-key ambiguity fail
 without replacing shortcuts. --get never creates directories or writes files.";
@@ -199,6 +200,69 @@ fn owns(action: &RawValue, command: &str) -> bool {
     matches!(action.into_rust::<SpawnAction>(), Ok(SpawnAction::Spawn(current)) if current == command)
 }
 
+fn disabled(action: &RawValue) -> bool {
+    #[derive(Deserialize)]
+    enum DisabledAction {
+        Disable,
+        None,
+    }
+    // COSMIC uses Disable for removed defaults, and treats invalid actions such
+    // as None as disabled. Unknown future actions remain conflicts here.
+    action.into_rust::<DisabledAction>().is_ok()
+}
+
+struct EffectiveBinding<'a> {
+    binding: Binding,
+    action: &'a RawValue,
+    custom_index: Option<usize>,
+    shadows_default: bool,
+}
+
+fn effective_bindings<'a>(
+    custom: &'a Entries,
+    defaults: &'a Entries,
+) -> Result<Vec<EffectiveBinding<'a>>> {
+    let parse = |key: &RawValue| -> Result<Binding> {
+        let mut binding: Binding = key.into_rust()?;
+        binding.modifiers = normalize_modifiers(binding.modifiers)?;
+        if !binding.key.is_empty() {
+            binding.key = canonical_key(&binding.key)?;
+        }
+        Ok(binding)
+    };
+    let mut effective = Vec::with_capacity(custom.0.len() + defaults.0.len());
+    for (index, (key, action)) in custom.0.iter().enumerate() {
+        effective.push(EffectiveBinding {
+            binding: parse(key)?,
+            action,
+            custom_index: Some(index),
+            shadows_default: false,
+        });
+    }
+    let custom_count = effective.len();
+    for (key, action) in &defaults.0 {
+        let binding = parse(key)?;
+        let mut shadowed = false;
+        for custom in &mut effective[..custom_count] {
+            // Upstream Binding equality/hash uses modifiers + keysym, ignoring
+            // description and keycode. Custom entries override even when disabled.
+            if custom.binding.modifiers == binding.modifiers && custom.binding.key == binding.key {
+                custom.shadows_default |= !disabled(action);
+                shadowed = true;
+            }
+        }
+        if !shadowed {
+            effective.push(EffectiveBinding {
+                binding,
+                action,
+                custom_index: None,
+                shadows_default: false,
+            });
+        }
+    }
+    Ok(effective)
+}
+
 fn owned_binding(entries: &Entries, command: &str) -> Result<Option<(usize, Chord)>> {
     let mut found = None;
     for (index, (key, action)) in entries.0.iter().enumerate() {
@@ -212,56 +276,89 @@ fn owned_binding(entries: &Entries, command: &str) -> Result<Option<(usize, Chor
     Ok(found)
 }
 
-fn check_conflicts(entries: &Entries, target: &Chord, owner: Option<usize>) -> Result<()> {
-    for (index, (key, _)) in entries.0.iter().enumerate() {
-        let binding: Binding = key.into_rust()?;
-        if normalize_modifiers(binding.modifiers)? != target.modifiers {
+fn check_conflicts(
+    entries: &[EffectiveBinding<'_>],
+    target: &Chord,
+    owner: Option<usize>,
+) -> Result<Option<usize>> {
+    let mut replacement = None;
+    let mut matched = false;
+    for entry in entries {
+        let binding = &entry.binding;
+        if binding.modifiers != target.modifiers {
             continue;
         }
-        // A physical shortcut with the same modifiers might map to this keysym
-        // in the active layout. Do not guess from a hard-coded keycode table.
-        if binding.keycode.is_some() {
+        let inactive = disabled(entry.action);
+        let source = if entry.custom_index.is_none() {
+            "Default shortcut conflict: "
+        } else {
+            ""
+        };
+        // An active physical shortcut might map to this keysym in the current
+        // layout. Disabled entries must not make unrelated keys ambiguous.
+        if binding.keycode.is_some() && !inactive {
             return Err(format!(
-                "{} may conflict with a physical-key shortcut; use COSMIC Settings",
+                "{source}{} may conflict with a physical-key shortcut; use COSMIC Settings",
                 target.label()
             )
             .into());
         }
-        // COSMIC also supports modifier-only actions, such as Super for Launcher.
-        // Those do not collide with a chord that includes a non-modifier key.
-        if binding.key.is_empty() {
+        // Modifier-only actions do not collide with a non-modifier chord.
+        if binding.key != target.key {
             continue;
         }
-        if canonical_key(&binding.key)? == target.key && owner != Some(index) {
+        if matched {
+            return Err(
+                "Duplicate shortcut bindings; resolve duplicates in COSMIC Settings first".into(),
+            );
+        }
+        matched = true;
+        if inactive {
+            if binding.keycode.is_some() {
+                return Err(
+                    "Physical-key binding is ambiguous; resolve it in COSMIC Settings first".into(),
+                );
+            }
+            replacement = entry.custom_index;
+        } else if entry.custom_index.is_none() || entry.custom_index != owner {
             return Err(format!(
-                "{} already has an action; no shortcuts were changed",
+                "{source}{} already has an action; no shortcuts were changed",
                 target.label()
             )
             .into());
         }
     }
-    Ok(())
+    Ok(replacement)
 }
 
 fn merge(text: &str, defaults: &str, command: &str, target: &Chord) -> Result<String> {
     let entries: Entries = ron::from_str(text)?;
+    let defaults: Entries = ron::from_str(defaults)?;
+    let effective = effective_bindings(&entries, &defaults)?;
     let owner = owned_binding(&entries, command)?;
-    check_conflicts(&entries, target, owner.as_ref().map(|(index, _)| *index))?;
-    check_conflicts(&ron::from_str(defaults)?, target, None)
-        .map_err(|error| format!("Default shortcut conflict: {error}"))?;
+    let replacement = check_conflicts(&effective, target, owner.as_ref().map(|(index, _)| *index))?;
     if owner.as_ref().is_some_and(|(_, current)| current == target) {
         return Ok(text.to_owned());
     }
     let owned_index = owner.map(|(index, _)| index);
+    let replaced_index = owned_index.or(replacement);
     let mut result = String::from("{\n");
     for (index, (key, action)) in entries.0.iter().enumerate() {
-        if owned_index == Some(index) {
+        if replaced_index == Some(index) {
             result.push_str(&format!(
-                "    {}: {},\n",
+                "    {}: Spawn({}),\n",
                 target.binding(Some(key))?,
-                action.get_ron().trim_start()
+                ron::to_string(command)?
             ));
-        } else {
+            if owned_index == Some(index)
+                && effective
+                    .iter()
+                    .any(|entry| entry.custom_index == Some(index) && entry.shadows_default)
+            {
+                // Moving our override must not reactivate the removed default.
+                result.push_str(&format!("    {}: Disable,\n", key.get_ron().trim_start()));
+            }
+        } else if replacement != Some(index) {
             result.push_str(&format!(
                 "    {}: {},\n",
                 key.get_ron().trim_start(),
@@ -269,7 +366,7 @@ fn merge(text: &str, defaults: &str, command: &str, target: &Chord) -> Result<St
             ));
         }
     }
-    if owned_index.is_none() {
+    if replaced_index.is_none() {
         result.push_str(&format!(
             "    {}: Spawn({}),\n",
             target.binding(None)?,
@@ -376,8 +473,9 @@ fn run() -> Result<()> {
         let text = read_optional(&directory.join("custom"))?.unwrap_or_else(|| "{}".into());
         let entries = ron::from_str(&text)?;
         if let Some((index, chord)) = owned_binding(&entries, command)? {
-            check_conflicts(&entries, &chord, Some(index))?;
-            check_conflicts(&ron::from_str(&defaults(&directory)?)?, &chord, None)?;
+            let defaults = ron::from_str(&defaults(&directory)?)?;
+            let effective = effective_bindings(&entries, &defaults)?;
+            check_conflicts(&effective, &chord, Some(index))?;
             println!("{}", chord.label());
         } else {
             println!("Unassigned");
@@ -538,7 +636,16 @@ mod tests {
         let merged = merge("{}", defaults, COMMAND, &target).unwrap();
         let entries = ron::from_str(&merged).unwrap();
         assert_eq!(owned_binding(&entries, COMMAND).unwrap().unwrap().1, target);
-        check_conflicts(&ron::from_str(defaults).unwrap(), &target, None).unwrap();
+        check_conflicts(
+            &effective_bindings(
+                &ron::from_str("{}").unwrap(),
+                &ron::from_str(defaults).unwrap(),
+            )
+            .unwrap(),
+            &target,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
