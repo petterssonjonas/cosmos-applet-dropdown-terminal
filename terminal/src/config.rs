@@ -259,6 +259,9 @@ pub struct Config {
     pub dropdown_always_on_top: bool,
     #[serde(default)]
     pub dropdown_close_on_focus_loss: bool,
+    /// Empty selects automatically; otherwise match the Wayland connector name.
+    #[serde(default)]
+    pub dropdown_output: String,
 }
 
 impl Default for Config {
@@ -289,6 +292,7 @@ impl Default for Config {
             dropdown_width_percent: default_dropdown_width_percent(),
             dropdown_always_on_top: default_dropdown_always_on_top(),
             dropdown_close_on_focus_loss: false,
+            dropdown_output: String::new(),
         }
     }
 }
@@ -424,5 +428,60 @@ impl Config {
                 Normal, SemiExpanded, Expanded, ExtraExpanded, UltraExpanded,
             }
         })[&self.font_stretch]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic_config::ConfigSet;
+
+    #[test]
+    fn legacy_config_without_output_preference_deserializes_as_automatic() {
+        let config = Config::default();
+        let serialized =
+            ron::ser::to_string_pretty(&config, ron::ser::PrettyConfig::default()).unwrap();
+        let legacy = serialized
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("dropdown_output:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!legacy.contains("dropdown_output:"));
+        assert_eq!(ron::from_str::<Config>(&legacy).unwrap(), config);
+    }
+
+    #[test]
+    fn named_output_preference_roundtrips_through_serde() {
+        let config = Config {
+            dropdown_output: "HDMI-A-1".into(),
+            ..Config::default()
+        };
+        let serialized = ron::to_string(&config).unwrap();
+        assert_eq!(ron::from_str::<Config>(&serialized).unwrap(), config);
+    }
+
+    #[test]
+    fn saved_connector_reloads_through_the_cosmic_config_entry() {
+        let path = std::env::temp_dir().join(format!(
+            "dropdown-backend-output-config-{}",
+            std::process::id()
+        ));
+        let handler = cosmic_config::Config::with_custom_path(
+            "dev.jp.CosmosDropdownTerminal",
+            CONFIG_VERSION,
+            path.clone(),
+        )
+        .unwrap();
+        handler.set("dropdown_output", "DP-2").unwrap();
+        let config = Config::get_entry(&handler).unwrap_or_else(|(errors, config)| {
+            assert!(
+                errors
+                    .iter()
+                    .all(|error| matches!(error, cosmic_config::Error::NotFound))
+            );
+            config
+        });
+        assert_eq!(config.dropdown_output, "DP-2");
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

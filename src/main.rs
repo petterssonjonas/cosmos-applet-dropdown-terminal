@@ -18,11 +18,23 @@ const MODIFIERS: [(Modifiers, &str); 4] = [
     (Modifiers::SHIFT, "Shift"),
 ];
 
+const SETTINGS_WIDTH: f32 = 460.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Menu,
     Settings,
     ConfirmRestart,
+}
+
+impl Page {
+    fn width(self) -> f32 {
+        match self {
+            Self::Menu => 200.0,
+            Self::Settings => SETTINGS_WIDTH,
+            Self::ConfirmRestart => 380.0,
+        }
+    }
 }
 
 struct Applet {
@@ -65,6 +77,7 @@ enum Message {
     ClosePopup(window::Id),
     Height(u8),
     Width(u8),
+    Output(String),
     AlwaysOnTop(bool),
     CloseOnFocusLoss(bool),
     ShortcutModifier(Modifiers, bool),
@@ -222,7 +235,7 @@ impl Applet {
         let id = window::Id::unique();
         self.popup = Some(id);
         self.page = page;
-        let width = if page == Page::Menu { 200.0 } else { 380.0 };
+        let width = page.width();
         let mut popup = self
             .core
             .applet
@@ -384,6 +397,9 @@ impl Applet {
             Message::Width(value) if !self.saving => {
                 self.preferences.dropdown_width_percent = value.clamp(1, 100);
             }
+            Message::Output(value) if !self.saving => {
+                self.preferences.dropdown_output = value.trim().to_owned();
+            }
             Message::AlwaysOnTop(value) if !self.saving => {
                 self.preferences.dropdown_always_on_top = value;
             }
@@ -463,6 +479,7 @@ impl Applet {
             | Message::ClosePopup(_)
             | Message::Height(_)
             | Message::Width(_)
+            | Message::Output(_)
             | Message::AlwaysOnTop(_)
             | Message::CloseOnFocusLoss(_)
             | Message::Save
@@ -494,7 +511,7 @@ impl Applet {
                 .into()
         }))
         .spacing(12);
-        let mut key = widget::text_input("§, F12, grave…", &self.shortcut_key);
+        let mut key = widget::text_input("§, F12, Escape, grave…", &self.shortcut_key);
         if !self.saving {
             key = key.on_input(Message::ShortcutKey);
         }
@@ -503,7 +520,7 @@ impl Applet {
             widget::text(shortcut_label).size(14).into(),
             modifiers.into(),
             key.into(),
-            widget::text("Enter a character or XKB key name. Do not press the whole combination.")
+            widget::text("Enter a character or XKB name, such as Escape (Esc also works). Escape leaves the field without closing settings.")
                 .size(12)
                 .into(),
         ])
@@ -512,10 +529,21 @@ impl Applet {
             shortcut_controls =
                 shortcut_controls.push(widget::text(format!("Error: {error}")).size(14));
         }
+        let mut output = widget::text_input("Automatic", &self.preferences.dropdown_output);
+        if !self.saving {
+            output = output.on_input(Message::Output);
+        }
         let content = widget::column([
             widget::text::title3("Dropdown settings").into(),
             shortcut_controls.into(),
             widget::divider::horizontal::default().into(),
+            widget::text("Monitor").into(),
+            output.into(),
+            widget::text(
+                "Enter a Wayland output name, e.g. DP-1 or HDMI-A-1 (listed by wayland-info). Leave blank for automatic selection. If disconnected, another monitor is used until it returns.",
+            )
+            .size(12)
+            .into(),
             widget::text(format!("Height: {height}% of screen")).into(),
             widget::slider(1..=100, height, Message::Height).into(),
             widget::text(format!("Width: {width}% of screen")).into(),
@@ -580,14 +608,19 @@ impl Applet {
         // Only the fields scroll; actions remain reachable at the popup's height limit.
         widget::container(
             widget::column([
-                widget::scrollable(content).height(Length::Fill).into(),
+                widget::scrollable(widget::container(content).padding(iced::Padding {
+                    right: 12.0,
+                    ..Default::default()
+                }))
+                .height(Length::Fill)
+                .into(),
                 widget::divider::horizontal::default().into(),
                 footer.into(),
             ])
             .spacing(12),
         )
-        .padding(16)
-        .width(380)
+        .padding(20)
+        .width(SETTINGS_WIDTH)
         .height(560)
         .into()
     }
@@ -720,7 +753,16 @@ impl cosmic::Application for Applet {
                 ]).spacing(12),
             ).padding(16).width(380).into(),
         };
-        self.core.applet.popup_container(content).into()
+        self.core
+            .applet
+            .popup_container(content)
+            .limits(
+                Limits::NONE
+                    .min_width(self.page.width())
+                    .max_width(self.page.width())
+                    .max_height(560.0),
+            )
+            .into()
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -741,11 +783,6 @@ impl cosmic::Application for Applet {
             iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
                 Some(Message::IconPointer(id, false))
             }
-            // Focused controls can capture Escape before navigation sees it.
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            }) => Some(Message::ClosePopup(id)),
             _ => None,
         });
         Subscription::batch([events, self.panel_guard.subscription().map(Message::Panel)])
@@ -802,6 +839,7 @@ mod tests {
         let _ = applet.update(Message::Width(60));
         let _ = applet.update(Message::AlwaysOnTop(false));
         let _ = applet.update(Message::CloseOnFocusLoss(true));
+        let _ = applet.update(Message::Output("DP-1".into()));
         assert_eq!(applet.original_preferences.as_ref(), Some(&original));
         let _ = applet.update(Message::Cancel);
         assert_eq!(applet.preferences, original);

@@ -186,3 +186,44 @@ fn rejects_physical_key_ambiguity_without_replacing_shortcuts() {
     );
     assert!(!sandbox.directory().join("custom.before-dropdown").exists());
 }
+
+#[test]
+fn escape_spellings_save_the_canonical_chord() {
+    for key in ["escape", "esc", "ESC", "Escape"] {
+        let sandbox = Sandbox::new();
+        sandbox.success(&["--set", "Super", key, COMMAND], "Super+Escape");
+        sandbox.success(&["--get", COMMAND], "Super+Escape");
+        let saved = fs::read_to_string(sandbox.directory().join("custom")).unwrap();
+        assert!(saved.contains("key: \"Escape\""), "{saved}");
+        sandbox.success(&["--set", "Super", "eScApE", COMMAND], "Super+Escape");
+        assert_eq!(
+            fs::read_to_string(sandbox.directory().join("custom")).unwrap(),
+            saved
+        );
+    }
+}
+
+#[test]
+fn equivalent_escape_conflicts_preserve_all_existing_files() {
+    for existing in ["Escape", "escape", "ESC"] {
+        let sandbox = Sandbox::new();
+        let original = format!(
+            "{{(modifiers: [Super], key: {existing:?}, future: Some(7)): Close,
+            (modifiers: [Alt], key: \"F12\"): Spawn({COMMAND:?})}}"
+        );
+        sandbox.custom(&original);
+        let backup = sandbox.directory().join("custom.before-dropdown");
+        fs::write(&backup, "existing backup").unwrap();
+        for requested in ["escape", "esc", "ESC", "Escape"] {
+            let output = sandbox.run(&["--set", "Super", requested, COMMAND]);
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("already has an action"));
+            assert_eq!(
+                fs::read_to_string(sandbox.directory().join("custom")).unwrap(),
+                original
+            );
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "existing backup");
+        }
+    }
+}

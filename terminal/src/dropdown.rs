@@ -34,6 +34,7 @@ pub struct Dropdown {
     surface_invalidated: bool,
     outputs: Vec<(WlOutput, OutputInfo)>,
     selected: Option<WlOutput>,
+    preferred_output: String,
     height_percent: u8,
     width_percent: u8,
     always_on_top: bool,
@@ -55,6 +56,7 @@ impl Default for Dropdown {
             surface_invalidated: false,
             outputs: Vec::new(),
             selected: None,
+            preferred_output: String::new(),
             height_percent: 40,
             width_percent: 100,
             always_on_top: true,
@@ -82,6 +84,16 @@ impl Dropdown {
         changed
     }
 
+    /// Select an exact connector name, or keep automatic selection when empty.
+    pub fn set_output(&mut self, name: &str) -> bool {
+        if self.preferred_output == name {
+            return false;
+        }
+        self.preferred_output.clear();
+        self.preferred_output.push_str(name);
+        self.select_output()
+    }
+
     pub fn layer(&self) -> Layer {
         if self.always_on_top || self.raised {
             Layer::Top
@@ -101,6 +113,9 @@ impl Dropdown {
     }
 
     pub fn focus_lost(&mut self) {
+        if self.surface_invalidated || self.phase == Phase::Closing {
+            return;
+        }
         self.focus_loss_pending = true;
     }
 
@@ -182,15 +197,9 @@ impl Dropdown {
         info: Option<OutputInfo>,
         removed: bool,
     ) -> bool {
-        let selected = self.selected.as_ref() == Some(&output);
         let before = self.output_size();
-        let previous_output = self.selected.clone();
         if removed {
             self.outputs.retain(|(id, _)| id != &output);
-            if selected {
-                self.surface_invalidated |= self.surface.is_some();
-                self.selected = None;
-            }
         } else if let Some(info) = info {
             if let Some((_, current)) = self.outputs.iter_mut().find(|(id, _)| id == &output) {
                 *current = info;
@@ -198,22 +207,48 @@ impl Dropdown {
                 self.outputs.push((output, info));
             }
         }
-        self.select_output();
-        if before != self.output_size() || self.selected != previous_output {
-            self.available_height = None;
-            self.surface_invalidated |= self.surface.is_some();
+        let selection_changed = self.select_output();
+        let size_changed = before != self.output_size();
+        if size_changed {
+            self.invalidate_output();
         }
-        before != self.output_size() || (removed && selected)
+        selection_changed || size_changed
     }
 
-    fn select_output(&mut self) {
-        if self.output_size().is_none() {
-            self.selected = self
-                .outputs
-                .iter()
-                .find(|(_, info)| logical_size(info).is_some())
-                .map(|(output, _)| output.clone());
+    fn invalidate_output(&mut self) {
+        self.available_height = None;
+        self.configured_size = None;
+        self.measurement_margin = None;
+        self.focus_loss_pending = false;
+        self.surface_invalidated |= self.surface.is_some();
+    }
+
+    fn select_output(&mut self) -> bool {
+        let selected = self
+            .outputs
+            .iter()
+            .find(|(_, info)| {
+                !self.preferred_output.is_empty()
+                    && info.name.as_deref() == Some(self.preferred_output.as_str())
+                    && logical_size(info).is_some()
+            })
+            .or_else(|| {
+                self.outputs.iter().find(|(output, info)| {
+                    Some(output) == self.selected.as_ref() && logical_size(info).is_some()
+                })
+            })
+            .or_else(|| {
+                self.outputs
+                    .iter()
+                    .find(|(_, info)| logical_size(info).is_some())
+            })
+            .map(|(output, _)| output);
+        if selected != self.selected.as_ref() {
+            self.selected = selected.cloned();
+            self.invalidate_output();
+            return true;
         }
+        false
     }
 
     fn output_size(&self) -> Option<(u32, u32)> {
@@ -277,6 +312,8 @@ impl Dropdown {
 
     pub fn resized(&mut self, id: window::Id, size: Size) -> bool {
         if self.surface != Some(id)
+            || self.surface_invalidated
+            || self.phase == Phase::Closing
             || !size.width.is_finite()
             || !size.height.is_finite()
             || size.width < 1.0
@@ -346,6 +383,181 @@ fn logical_mode_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::cctk::sctk::{
+        output::OutputData,
+        reexports::client::{Connection, delegate_noop, protocol::wl_registry::WlRegistry},
+    };
+    use std::os::unix::net::UnixStream;
+
+    struct OutputEvents;
+    delegate_noop!(OutputEvents: ignore WlRegistry);
+    delegate_noop!(OutputEvents: ignore WlOutput);
+
+    fn outputs<const N: usize>() -> (Connection, UnixStream, [WlOutput; N]) {
+        let (socket, compositor) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<OutputEvents>();
+        let handle = queue.handle();
+        let registry = connection.display().get_registry(&handle, ());
+        let outputs = std::array::from_fn(|index| registry.bind(index as u32 + 1, 4, &handle, ()));
+        (connection, compositor, outputs)
+    }
+
+    fn output_info(name: &str) -> OutputInfo {
+        let mut info = OutputData::new(1).with_output_info(Clone::clone);
+        info.name = Some(name.into());
+        info.logical_size = Some((1920, 1080));
+        info
+    }
+
+    fn assert_settings_output(dropdown: &mut Dropdown, expected: &WlOutput) {
+        let settings = dropdown.settings().unwrap();
+        assert!(matches!(settings.output, IcedOutput::Output(output) if output == *expected));
+    }
+
+    #[test]
+    fn automatic_selection_keeps_the_current_usable_output() {
+        let (_connection, _compositor, [first, current]) = outputs();
+        let mut dropdown = Dropdown::default();
+        let mut unavailable = output_info("DP-1");
+        unavailable.logical_size = None;
+        assert!(!dropdown.update_output(first.clone(), Some(unavailable), false));
+        assert!(dropdown.update_output(current.clone(), Some(output_info("HDMI-A-1")), false));
+        assert!(!dropdown.update_output(first, Some(output_info("DP-1")), false));
+        dropdown.visible = true;
+        assert_settings_output(&mut dropdown, &current);
+    }
+
+    #[test]
+    fn preferred_output_requires_an_exact_connector_name_and_usable_size() {
+        let (_connection, _compositor, [fallback, preferred]) = outputs();
+        let mut dropdown = Dropdown::default();
+        dropdown.set_output("DP-1");
+        let mut fallback_info = output_info("DP-10");
+        fallback_info.model = "DP-1".into();
+        assert!(dropdown.update_output(fallback.clone(), Some(fallback_info), false));
+        let mut unavailable = output_info("DP-1");
+        unavailable.logical_size = Some((0, 1080));
+        assert!(!dropdown.update_output(preferred.clone(), Some(unavailable), false));
+        dropdown.visible = true;
+        assert_settings_output(&mut dropdown, &fallback);
+        assert!(dropdown.update_output(preferred.clone(), Some(output_info("DP-1")), false));
+        assert_settings_output(&mut dropdown, &preferred);
+    }
+
+    #[test]
+    fn switching_equal_sized_outputs_remaps_and_discards_old_panel_measurement() {
+        let (_connection, _compositor, [first, second]) = outputs();
+        let mut dropdown = Dropdown::default();
+        dropdown.update_output(first, Some(output_info("DP-1")), false);
+        dropdown.update_output(second.clone(), Some(output_info("DP-2")), false);
+        dropdown.visible = true;
+        let old = dropdown.settings().unwrap().id;
+        dropdown.begin_create(old);
+        dropdown.resized(old, Size::new(1920.0, 1000.0));
+        dropdown.opened(old);
+        dropdown.resized(old, Size::new(1920.0, 432.0));
+        assert!(dropdown.content_size().is_some());
+        assert!(dropdown.set_output("DP-2"));
+        assert_eq!(dropdown.available_height, None);
+        assert_eq!(dropdown.measurement_margin, None);
+        assert_eq!(dropdown.content_size(), None);
+        assert!(!dropdown.resized(old, Size::new(1920.0, 1000.0)));
+        assert_eq!(dropdown.available_height, None);
+        assert_eq!(dropdown.begin_close(), Some(old));
+        dropdown.surface_closed(old);
+        assert!(dropdown.visible);
+        assert_settings_output(&mut dropdown, &second);
+    }
+
+    #[test]
+    fn missing_preference_keeps_fallback_and_reconnect_restores_requested_output() {
+        let (_connection, _compositor, [fallback, preferred, reconnected]) = outputs();
+        let mut dropdown = Dropdown::default();
+        dropdown.set_output("DP-2");
+        assert!(dropdown.update_output(fallback.clone(), Some(output_info("DP-1")), false));
+        assert!(dropdown.update_output(preferred.clone(), Some(output_info("DP-2")), false));
+        dropdown.visible = true;
+        let old = dropdown.settings().unwrap().id;
+        dropdown.begin_create(old);
+        dropdown.opened(old);
+        assert!(dropdown.update_output(preferred, None, true));
+        assert_eq!(dropdown.begin_close(), Some(old));
+        dropdown.surface_closed(old);
+        let settings = dropdown.settings().unwrap();
+        assert!(matches!(settings.output, IcedOutput::Output(output) if output == fallback));
+        dropdown.begin_create(settings.id);
+        dropdown.opened(settings.id);
+        assert!(dropdown.update_output(reconnected.clone(), Some(output_info("DP-2")), false));
+        assert_eq!(dropdown.begin_close(), Some(settings.id));
+        dropdown.surface_closed(settings.id);
+        assert!(dropdown.visible);
+        assert_eq!(dropdown.preferred_output, "DP-2");
+        assert_settings_output(&mut dropdown, &reconnected);
+    }
+
+    #[test]
+    fn output_changes_during_creation_and_closing_preserve_latest_preference() {
+        let (_connection, _compositor, [first, second]) = outputs();
+        let mut dropdown = Dropdown::default();
+        dropdown.update_output(first, Some(output_info("DP-1")), false);
+        dropdown.update_output(second.clone(), Some(output_info("DP-2")), false);
+        dropdown.visible = true;
+        let old = dropdown.settings().unwrap().id;
+        dropdown.begin_create(old);
+        dropdown.focus_lost();
+        assert!(dropdown.set_output("DP-2"));
+        dropdown.focus_lost();
+        assert!(!dropdown.take_focus_loss());
+        assert_eq!(dropdown.begin_close(), None);
+        assert!(dropdown.opened(old));
+        assert_eq!(dropdown.begin_close(), Some(old));
+        assert!(dropdown.set_output("DP-1"));
+        assert!(dropdown.set_output("DP-2"));
+        assert!(dropdown.settings().is_none());
+        assert!(dropdown.surface_closed(old));
+        assert!(dropdown.visible);
+        assert_settings_output(&mut dropdown, &second);
+    }
+
+    #[test]
+    fn disconnect_during_creation_waits_visibly_for_the_preferred_output_to_return() {
+        let (_connection, _compositor, [initial, reconnected]) = outputs();
+        let mut dropdown = Dropdown::default();
+        dropdown.set_output("DP-1");
+        dropdown.update_output(initial.clone(), Some(output_info("DP-1")), false);
+        dropdown.visible = true;
+        let old = dropdown.settings().unwrap().id;
+        dropdown.begin_create(old);
+        assert!(dropdown.update_output(initial, None, true));
+        assert_eq!(dropdown.dimensions(), None);
+        assert!(dropdown.surface_closed(old));
+        assert!(dropdown.visible);
+        assert!(dropdown.settings().is_none());
+        assert!(dropdown.update_output(reconnected.clone(), Some(output_info("DP-1")), false));
+        assert_settings_output(&mut dropdown, &reconnected);
+        let new = dropdown.settings().unwrap().id;
+        dropdown.begin_create(new);
+        assert!(!dropdown.surface_closed(old));
+        assert!(dropdown.opened(new));
+        assert!(dropdown.visible);
+    }
+
+    #[test]
+    fn hidden_output_preferences_apply_without_creating_a_surface() {
+        let (_connection, _compositor, [first, second]) = outputs();
+        let mut dropdown = Dropdown::default();
+        dropdown.update_output(first, Some(output_info("DP-1")), false);
+        dropdown.update_output(second.clone(), Some(output_info("DP-2")), false);
+        assert!(dropdown.set_output("DP-2"));
+        assert!(!dropdown.set_output("DP-2"));
+        assert!(!dropdown.set_output("DP-99"));
+        assert!(!dropdown.set_output(""));
+        assert!(dropdown.surface.is_none());
+        assert!(dropdown.settings().is_none());
+        dropdown.visible = true;
+        assert_settings_output(&mut dropdown, &second);
+    }
 
     #[test]
     fn measurement_and_stale_bounds_do_not_match_requested_content_geometry() {

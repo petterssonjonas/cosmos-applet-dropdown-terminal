@@ -111,7 +111,12 @@ fn canonical_key(key: &str) -> Result<String> {
     let symbol = if characters.next().is_none() {
         xkb::utf32_to_keysym(u32::from(first))
     } else {
-        xkb::keysym_from_name(key, xkb::KEYSYM_NO_FLAGS)
+        let name = if key.eq_ignore_ascii_case("esc") {
+            "Escape"
+        } else {
+            key
+        };
+        xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE)
     };
     let name = xkb::keysym_get_name(symbol);
     if symbol.raw() == 0 || name.is_empty() || name == "VoidSymbol" || name.starts_with("0x") {
@@ -432,6 +437,31 @@ mod tests {
         }
         assert!(Chord::parse("Super,Super", "F12").is_err());
         assert!(Chord::parse("Meta", "F12").is_err());
+    }
+
+    #[test]
+    fn canonicalizes_case_insensitive_names_without_folding_single_characters() {
+        for key in ["esc", "ESC", "escape", "Escape", "eScApE"] {
+            assert_eq!(Chord::parse("Super", key).unwrap().label(), "Super+Escape");
+        }
+        assert_eq!(canonical_key("rEtUrN").unwrap(), "Return");
+        assert_eq!(canonical_key("SECTION").unwrap(), "section");
+        assert_eq!(canonical_key("a").unwrap(), "a");
+        assert_eq!(canonical_key("A").unwrap(), "A");
+        assert_eq!(canonical_key("é").unwrap(), "eacute");
+        assert_eq!(canonical_key("É").unwrap(), "Eacute");
+    }
+
+    #[test]
+    fn escape_aliases_conflict_with_equivalent_custom_and_default_actions() {
+        for existing in ["Escape", "escape", "ESC"] {
+            let conflict = format!("{{(modifiers: [Super], key: {existing:?}): Close}}");
+            for requested in ["Escape", "escape", "esc", "ESC"] {
+                let target = Chord::parse("Super", requested).unwrap();
+                assert!(merge(&conflict, "{}", COMMAND, &target).is_err());
+                assert!(merge("{}", &conflict, COMMAND, &target).is_err());
+            }
+        }
     }
 
     #[test]

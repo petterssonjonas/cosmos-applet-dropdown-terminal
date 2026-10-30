@@ -253,7 +253,7 @@ Usage: cosmos-applet-dropdown-terminal-backend [toggle|show|hide|status|reload|q
 Socket: $XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/control.sock
 Commands: toggle/show/hide/status/reload/quit/panel-guard followed by newline.
 Replies: visible/hidden/reloaded/bye/guarded, or error MESSAGE followed by newline.
-First advertised usable output is selected; output changes resize the surface."#
+The configured connector is preferred; otherwise the current or first usable output is selected."#
     );
 }
 
@@ -2168,6 +2168,7 @@ impl Application for App {
             app.config.dropdown_width_percent,
             app.config.dropdown_always_on_top,
         );
+        app.dropdown.set_output(&app.config.dropdown_output);
         app.set_curr_font_weights_and_stretches();
         let command = Task::batch([app.update_config(), app.update_title(None)]);
 
@@ -2536,6 +2537,7 @@ impl Application for App {
                     config.dropdown_width_percent,
                     config.dropdown_always_on_top,
                 );
+                let output_changed = self.dropdown.set_output(&config.dropdown_output);
                 let config = if *config != self.config {
                     let shortcuts_changed = config.shortcuts_custom != self.config.shortcuts_custom;
                     log::info!("update config");
@@ -2550,7 +2552,7 @@ impl Application for App {
                 } else {
                     Task::none()
                 };
-                return if geometry_changed {
+                return if geometry_changed || output_changed {
                     config
                         .chain(self.reconcile_dropdown())
                         .chain(self.resize_dropdown_surface())

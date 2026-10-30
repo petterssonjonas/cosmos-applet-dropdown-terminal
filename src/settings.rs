@@ -15,6 +15,8 @@ pub struct Preferences {
     pub dropdown_always_on_top: bool,
     #[serde(default)]
     pub dropdown_close_on_focus_loss: bool,
+    #[serde(default)]
+    pub dropdown_output: String,
 }
 
 impl Default for Preferences {
@@ -24,6 +26,7 @@ impl Default for Preferences {
             dropdown_width_percent: 100,
             dropdown_always_on_top: true,
             dropdown_close_on_focus_loss: false,
+            dropdown_output: String::new(),
         }
     }
 }
@@ -76,7 +79,7 @@ fn save_to(
                     ));
                 }
                 transaction
-                    .set(stringify!($field), draft.$field)
+                    .set(stringify!($field), &draft.$field)
                     .map_err(|error| error.to_string())?;
             }
         };
@@ -85,6 +88,7 @@ fn save_to(
     stage!(dropdown_width_percent);
     stage!(dropdown_always_on_top);
     stage!(dropdown_close_on_focus_loss);
+    stage!(dropdown_output);
     // COSMIC commits keys individually, so callers must report possible partial writes.
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -118,6 +122,7 @@ mod tests {
         let mut draft = original.clone();
         draft.dropdown_height_percent = 75;
         draft.dropdown_close_on_focus_loss = true;
+        draft.dropdown_output = "DP-1".into();
         config.set("dropdown_width_percent", 65_u8).unwrap();
         save_to(&config, &original, &draft).unwrap();
         draft.dropdown_width_percent = 65;
@@ -140,6 +145,24 @@ mod tests {
             original.dropdown_height_percent
         );
         assert!(!load_from(&config).unwrap().dropdown_close_on_focus_loss);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn conflicting_monitor_change_does_not_overwrite_preferences() {
+        let (path, config) = config();
+        let original = load_from(&config).unwrap();
+        let mut draft = original.clone();
+        draft.dropdown_output = "DP-1".into();
+        draft.dropdown_height_percent = 75;
+        config.set("dropdown_output", "HDMI-A-1").unwrap();
+        assert!(save_to(&config, &original, &draft).is_err());
+        let current = load_from(&config).unwrap();
+        assert_eq!(current.dropdown_output, "HDMI-A-1");
+        assert_eq!(
+            current.dropdown_height_percent,
+            original.dropdown_height_percent
+        );
         std::fs::remove_dir_all(path).unwrap();
     }
 

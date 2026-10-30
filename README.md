@@ -92,16 +92,19 @@ Right-click the panel icon. Select **Settings**.
 
 | Setting | Default | Use |
 | --- | --- | --- |
+| Monitor | Automatic | Set an exact Wayland output name, such as `DP-1` or `HDMI-A-1`. Blank uses automatic selection. |
 | Height | 40% | Set the height as a percentage of the screen. |
 | Width | 100% | Set the width as a percentage of the screen. A narrow dropdown is centered. |
 | Always on top | On | Keep the dropdown above other windows without blocking their keyboard input. |
 | Close on focus loss | Off | Hide the dropdown when focus leaves it. Keep its shells and jobs running. |
 
-Height and width accept 1% to 100%. Select **Save** to apply edited settings to the open terminal. Select **Cancel**, press Escape or close the popup to discard unsaved edits. If Save reports an error, read the message: some fields may already be saved.
+Height and width accept 1% to 100%. Select **Save** to apply edited settings to the open terminal. Select **Cancel**, press Escape outside a text field or close the popup to discard unsaved edits. Inside a text field, Escape leaves the field without closing settings. If Save reports an error, read the message: some fields may already be saved.
 
 Use **Settings** to change the height and width. Mouse resizing is not supported. There is no resize handle or bottom size bar. The terminal has a minimum size of 96 × 96 logical pixels. The screen and reserved panel space limit its size.
 
-To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12` or `grave`. Select **Save**. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
+For a multi-monitor setup, enter the desired connector name in **Monitor**. Run `wayland-info` and look for the output's `name` (not its make/model description). Names are case-sensitive. Saving moves the dropdown without closing its shells or jobs. If that monitor is disconnected, the dropdown falls back to another usable output and returns when the selected monitor reconnects. Wayland does not expose a universal primary-monitor flag; automatic selection keeps the current usable output, initially the first one advertised by the compositor.
+
+To change the shortcut, select its modifiers: **Super**, **Ctrl**, **Alt** or **Shift**. Enter a character or XKB key name, such as `§`, `F12`, `Escape` or `grave`. XKB names are case-insensitive; `Esc` and `escape` both become `Escape`. For **Super+Escape**, select **Super**, type `Esc` in the key field, then select **Save**. Pressing Escape in the field releases its focus rather than recording the key or closing settings. Do not press the whole combination in the key field. Close COSMIC Settings before you save a shortcut. If the combination is already in use, the applet shows an error and keeps the old shortcut. You can also record a combination in COSMIC Settings, as described above.
 
 The terminal opens at the top edge, above application windows and below reserved panel space. **Always on top** controls stacking only. With it off, clicking another application lets that application cover the dropdown. With it on, the dropdown stays above that application, but the application can receive keyboard input.
 
@@ -147,7 +150,7 @@ If an old backend cannot protect panel interaction, the icon shows a warning and
 
 Preferences use `~/.config/cosmic/dev.jp.CosmosDropdownTerminal`, separate from stock COSMIC Terminal. Logs use `$XDG_RUNTIME_DIR/cosmos-applet-dropdown-terminal-backend/backend.log`; the control directory and socket are private to your user.
 
-The backend selects the first usable compositor output, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
+The backend uses the configured Wayland output, or an automatic fallback when it is unavailable, not the pointer's output. Autohiding panels can overlap it. A compositor disconnect stops the backend and closes its terminal sessions. There is no animation or session restoration after logout or a compositor restart.
 
 Checks in an isolated COSMIC session covered all four combinations of Always on top and Close on focus loss. Other applications received keyboard input in every combination. Separate mouse-down and release checks confirmed one toggle per completed icon click. Moving the pointer away without changing focus did not hide the terminal. The backend process, shell process, shell variables and terminal dimensions stayed unchanged across normal toggles and focus-loss hiding.
 
