@@ -12,6 +12,8 @@ Hiding keeps shells, jobs, tabs, panes and scrollback. Closing the window hides 
 
 Runtime: a COSMIC Wayland session with layer-shell and data-control clipboard support, working graphics drivers and terminal fonts. There is no X11 fallback. No Python process or external clipboard command is needed at runtime.
 
+The applet and backend lockfiles track libcosmic `95236a9`; keep both checked-in lockfiles when rebuilding. The backend needs the desktop session's `WAYLAND_DISPLAY` and deliberately reconnects there instead of using the panel's private `WAYLAND_SOCKET`. After upgrading, follow the backend restart procedure below once its shell jobs are finished; replacing executables alone does not update running processes.
+
 Build/install: current stable Rust from [rustup](https://rustup.rs), `just`, Bash, GNU coreutils/findutils, Git and the native development packages below. Distribution Rust packages can be too old. These are package examples, not a claim that all distributions were tested.
 
 Fedora:
